@@ -1,5 +1,7 @@
 # Glane Notes — Offline-First Voice Note Recorder on ESP32-S3 + E-Paper
 
+**🌐 Language / 语言**: **English** | [简体中文](README_CN.md)
+
 > A pocketable "second brain" voice recorder: **press to record, release to save**.
 > Capture fleeting ideas in seconds, fully offline — transcribe to text later via
 > the cloud, on your terms.
