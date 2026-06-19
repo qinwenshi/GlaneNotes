@@ -1,0 +1,4 @@
+## IDF Component Manager manifest
+## Transcription uses esp_http_client (IDF core) — no managed components needed.
+dependencies:
+  idf: ">=5.5.0"

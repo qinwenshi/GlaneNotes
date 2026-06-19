@@ -1,0 +1,55 @@
+# ── Flash / RAM ──────────────────────────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ── PSRAM (OPI/Octal 8MB) ────────────────────────────────────────────────────
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ── Partition table ──────────────────────────────────────────────────────────
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ── CPU ──────────────────────────────────────────────────────────────────────
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ── USB CDC console (matches Arduino build) ──────────────────────────────────
+CONFIG_ESP_CONSOLE_USB_CDC=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# ── FreeRTOS ─────────────────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# app_main runs here — needs space for SD scan, e-ink init, wifi/httpd bring-up
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ── C++ exceptions ───────────────────────────────────────────────────────────
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
+# ── SDMMC ────────────────────────────────────────────────────────────────────
+CONFIG_SDMMC_IO_POWER_DOMAIN_DEFAULT=n
+
+# ── FATFS long filenames (note-<epoch>.wav / .txt) ───────────────────────────
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# ── TLS: use the bundled root-cert store for DashScope WSS ────────────────────
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# ── HTTP server: allow longer URIs / more handlers ───────────────────────────
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# ── NVS encryption off ───────────────────────────────────────────────────────
+CONFIG_NVS_ENCRYPTION=n

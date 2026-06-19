@@ -1,0 +1,24 @@
+# ── ESP-IDF build output ──────────────────────────────────────────────
+build/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# Component manager download cache (dependencies.lock is kept for reproducibility)
+managed_components/
+
+# ── Editor / IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── macOS / OS cruft ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs & temp ───────────────────────────────────────────────────────
+*.log
+*.tmp
