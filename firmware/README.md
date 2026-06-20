@@ -207,6 +207,18 @@ The e-ink screen shows English status text (idle / recording / syncing / message
 Chinese (or any) transcripts are viewable in the web dashboard and the `.txt`
 files on the SD card.
 
+### Buddy the dog mascot
+
+The home screen shows **Buddy**, a small dog sprite (ported from the
+`ESP32-S3-EPaper-Player` project, LVGL "I1" 1-bit frames in
+[`main/dog_sprites.h`](main/dog_sprites.h)). When the device wakes / returns home
+Buddy plays a short **running ("awake") animation** on the right half of the
+screen; the deep-sleep screen shows Buddy **resting with a "Zzz"**. The animation
+is a brief one-cycle burst driven by the main loop (not a continuous loop), so it
+never blocks button input or drains the battery while idle. The sleep image is
+drawn with a full refresh so it stays clean on the panel after the e-paper rail
+is powered off.
+
 ### Web dashboard
 
 When connected to Wi-Fi the device serves a dashboard on its IP:

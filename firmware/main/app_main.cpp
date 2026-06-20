@@ -54,6 +54,9 @@ static volatile bool    s_wifi_connecting = false;  // boot-time bg connect in f
 static volatile bool    s_wifi_evt        = false;  // bg connect just succeeded
 static uint32_t         s_last_activity  = 0;
 static uint32_t         s_rec_ui_tick    = 0;
+static uint32_t         s_dog_tick       = 0;   // home-screen dog animation timer
+static int              s_dog_left       = 0;   // remaining frames in the wake burst
+static int              s_dog_frame      = 0;
 static char             s_rec_path[160]  = {0};
 
 // ── Notes browser ────────────────────────────────────────────────────────────
@@ -93,6 +96,11 @@ static void show_idle(void)
 {
     ui_show_idle(count_notes(), wifi_mgr_is_connected() ? 1 : 0, wifi_mgr_ip(),
                  battery_percent());
+    // Kick off the "awake" dog animation: one running cycle, played by the main
+    // loop so button input stays responsive between frames.
+    s_dog_frame = 0;
+    s_dog_left  = ui_idle_dog_frames();
+    s_dog_tick  = millis();
 }
 
 // ── Sync flow ────────────────────────────────────────────────────────────────
@@ -252,7 +260,7 @@ static void enter_deep_sleep(void)
     recorder_wait_finalized(8000);   // ensure the WAV is fully written before the SD rail drops
     webserver_stop();
     wifi_mgr_disconnect();
-    ui_show_message("SLEEPING", "Press to wake");
+    ui_show_sleeping();
 
     gpio_set_level((gpio_num_t)AUDIO_PWR, 1);   // audio rail off
     gpio_set_level((gpio_num_t)EPD_PWR,   1);   // e-paper rail off
@@ -446,6 +454,16 @@ static void main_task(void *)
             ui_show_message("SAVED", "Restarting...");
             vTaskDelay(pdMS_TO_TICKS(1500));
             esp_restart();
+        }
+
+        // Home-screen dog "awake" animation burst (one running cycle). Plays one
+        // frame per interval so the button loop stays responsive; never resets the
+        // idle timer, so auto-sleep still works.
+        if (s_state == State::IDLE && s_dog_left > 0 &&
+            millis() - s_dog_tick >= 150) {
+            s_dog_tick = millis();
+            ui_idle_dog_anim(++s_dog_frame);
+            s_dog_left--;
         }
 
         // Idle deep-sleep timer (only from the home screen).

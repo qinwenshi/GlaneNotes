@@ -30,6 +30,17 @@ void ui_show_detail(const note_info_t *item, int number);
 // Playback screen for the given note number.
 void ui_show_playing(int number);
 
+// Sleep screen: a resting dog + "Zzz", shown right before deep sleep. The e-ink
+// panel retains this image while the device is asleep.
+void ui_show_sleeping(void);
+
+// Animate the active (running) dog on the idle/home screen. Call repeatedly with
+// an incrementing frame index to play the "awake" animation; only the dog region
+// is redrawn (a fast partial refresh), the rest of the home screen is preserved.
+// Returns the number of available animation frames.
+int  ui_idle_dog_frames(void);
+void ui_idle_dog_anim(int frame);
+
 #ifdef __cplusplus
 }
 #endif

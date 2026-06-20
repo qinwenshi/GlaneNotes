@@ -12,6 +12,7 @@
 #include "ui.h"
 #include "glane_config.h"
 #include "font5x7.h"
+#include "dog_sprites.h"
 #include "timesync.h"
 #include "epaper_driver_bsp.h"
 #include "esp_log.h"
@@ -57,6 +58,19 @@ static void commit(ScreenKind kind)
         s_epd->EPD_DisplayPart();   // fast, no-flash partial refresh
         s_partial_count++;
     }
+}
+
+// Push the current buffer with a clean FULL (flashing) refresh. Used for the
+// deep-sleep screen, which stays latched on the panel after the e-paper rail is
+// cut — a partial refresh could leave ghosting or a half-formed image frozen on
+// the powered-off display. No need to re-enter partial mode: deep sleep follows.
+static void commit_full(ScreenKind kind)
+{
+    if (!s_epd) return;
+    s_scr = kind;
+    s_epd->EPD_Init();
+    s_epd->EPD_Display();
+    s_partial_count = 0;
 }
 
 // ── Primitive drawing into the EPD buffer ────────────────────────────────────
@@ -121,6 +135,35 @@ static void fill_rect(int x0, int y0, int x1, int y1)
 {
     for (int y = y0; y <= y1; y++)
         for (int x = x0; x <= x1; x++) px(x, y, true);
+}
+
+// Draw a 1-bit LVGL-I1 sprite frame at (ox,oy). The 8-byte palette is skipped;
+// pixels are packed MSB-first, one bit per pixel, and bit==1 means black.
+static void draw_i1_sprite(const uint8_t *data, int w, int h, int stride,
+                           int ox, int oy)
+{
+    const uint8_t *bits = data + 8;   // skip the 2-colour palette header
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = bits + y * stride;
+        for (int x = 0; x < w; x++) {
+            if ((row[x >> 3] >> (7 - (x & 7))) & 1) px(ox + x, oy + y, true);
+        }
+    }
+}
+
+// ── Home-screen dog layout (right half of the 200x200 panel) ─────────────────
+static const int DOG_OX = 100;
+static const int DOG_OY = 46;
+
+// Repaint just the dog region white, then stamp one running frame into it.
+static void draw_idle_dog(int frame)
+{
+    if (frame < 0) frame = 0;
+    frame %= DOG_RUNNING_FRAMES;
+    for (int y = DOG_OY; y < DOG_OY + DOG_SPRITE_H; y++)
+        for (int x = DOG_OX; x < DOG_OX + DOG_SPRITE_W; x++) px(x, y, false);
+    draw_i1_sprite(dog_running_frames[frame], DOG_SPRITE_W, DOG_SPRITE_H,
+                   DOG_SPRITE_STRIDE, DOG_OX, DOG_OY);
 }
 
 // Small battery icon at top-left (x,y): an outline, a positive-terminal nub, and
@@ -191,22 +234,54 @@ void ui_show_idle(int note_count, int wifi_connected, const char *ip, int batter
         draw_text(50, 8, b, 1);
     }
 
-    draw_text_centered(30, "GLANE NOTES", 2);
-    hline(52, 20, EPD_W - 20);
+    draw_text_centered(28, "GLANE NOTES", 2);
 
+    // Left column: status text. Right half: the awake (running) dog.
     char buf[48];
-    snprintf(buf, sizeof(buf), "Notes: %d", note_count);
-    draw_text(24, 70, buf, 2);
+    snprintf(buf, sizeof(buf), "Notes:%d", note_count);
+    draw_text(8, 60, buf, 1);
+    draw_text(8, 80, wifi_connected ? "WiFi:ON" : "WiFi:--", 1);
+    if (wifi_connected && ip && ip[0]) draw_text(8, 100, ip, 1);
 
-    draw_text(24, 100, wifi_connected ? "WiFi: ON" : "WiFi: --", 2);
-    if (wifi_connected && ip && ip[0]) {
-        draw_text(24, 126, ip, 1);
-    }
+    draw_idle_dog(0);
 
-    hline(160, 20, EPD_W - 20);
-    draw_text_centered(170, "PRESS TO RECORD", 1);
-    draw_text_centered(184, "HOLD TO SYNC", 1);
+    hline(160, 16, EPD_W - 16);
+    draw_text_centered(168, "PRESS TO RECORD", 1);
+    draw_text_centered(182, "HOLD TO SYNC", 1);
     commit(SCR_IDLE);
+}
+
+int ui_idle_dog_frames(void) { return DOG_RUNNING_FRAMES; }
+
+// Advance the home-screen dog animation by one frame (fast partial refresh of
+// just the dog region). The rest of the idle screen is left untouched.
+void ui_idle_dog_anim(int frame)
+{
+    if (!s_epd || s_scr != SCR_IDLE) return;
+    draw_idle_dog(frame);
+    s_epd->EPD_DisplayPart();
+    s_partial_count++;
+}
+
+// Sleep screen: the resting dog + "Zzz". Retained on the panel during deep sleep.
+void ui_show_sleeping(void)
+{
+    if (!s_epd) return;
+    s_epd->EPD_Clear();
+    draw_text_centered(14, "SLEEPING", 2);
+
+    int ox = (EPD_W - DOG_SPRITE_W) / 2;
+    int oy = 44;
+    draw_i1_sprite(dog_sleep_frame, DOG_SPRITE_W, DOG_SPRITE_H,
+                   DOG_SPRITE_STRIDE, ox, oy);
+
+    // A little "Zzz" floating above the dog's head (top-right of the sprite).
+    draw_text(ox + DOG_SPRITE_W - 10, oy - 2, "z", 1);
+    draw_text(ox + DOG_SPRITE_W - 2,  oy - 8, "z", 2);
+    draw_text(ox + DOG_SPRITE_W + 12, oy - 16, "Z", 3);
+
+    draw_text_centered(170, "Press to wake", 1);
+    commit_full(SCR_SLEEP);
 }
 
 void ui_show_recording(uint32_t elapsed_sec)
