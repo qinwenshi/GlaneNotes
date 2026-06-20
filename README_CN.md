@@ -21,6 +21,18 @@ ES8311 音频编解码. -->
 
 ---
 
+## 📸 演示
+
+<p align="center">
+  <img src="docs/demo_sleeping.jpg" alt="Glane Notes 休眠界面与小狗吉祥物 Buddy" height="320">
+</p>
+
+墨水屏的**休眠界面**会显示吉祥物 *Buddy*——一只犯困打盹的像素风小狗，头顶飘着
+`zZ`。按下按键即可唤醒设备并开始录音。唤醒/录音动画的演示短片见
+[`docs/demo_activate.mp4`](docs/demo_activate.mp4)。
+
+---
+
 ## ✨ Glane Notes 的与众不同之处
 
 - **🔌 离线优先（Capture-first）。** 录音、本机笔记列表、扬声器回放**完全本地化**。

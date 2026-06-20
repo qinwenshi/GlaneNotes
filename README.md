@@ -25,6 +25,18 @@ second brain device, DIY voice recorder, SSD1681 e-paper, ES8311 codec. -->
 
 ---
 
+## 📸 Demo
+
+<p align="center">
+  <img src="docs/demo_sleeping.jpg" alt="Glane Notes sleeping screen with the Buddy dog mascot" height="320">
+</p>
+
+The e-ink **sleep screen** shows *Buddy* — a sleepy pixel-art dog dozing under a
+`zZ`. Press the button to wake the device and start recording. A short demo clip
+of the wake/record animation is in [`docs/demo_activate.mp4`](docs/demo_activate.mp4).
+
+---
+
 ## ✨ Why Glane Notes is different
 
 - **🔌 Offline-first capture.** Recording, the on-device note list, and speaker
