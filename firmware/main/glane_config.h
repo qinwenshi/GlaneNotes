@@ -57,7 +57,7 @@
 #define REC_BITS          16
 #define REC_CHANNELS      1
 #define REC_MAX_SECONDS   600     // hard cap (~19 MB) to avoid runaway files
-#define REC_SW_GAIN       4       // software gain for the quiet onboard mic
+#define REC_SW_GAIN       8       // software gain for the quiet onboard mic
 
 // ── Filesystem layout ────────────────────────────────────────────────────────
 #define SD_MOUNT          "/sdcard"

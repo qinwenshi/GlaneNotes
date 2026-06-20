@@ -261,7 +261,9 @@ static void rec_task(void *)
 
             // Extract the chosen candidate, decimate /REC_DECIM (48k->16k) by
             // averaging, DC-block, then apply gain. dec_acc/dec_cnt carry across
-            // reads so no samples are dropped at chunk boundaries.
+            // reads so no samples are dropped at chunk boundaries. Output is not
+            // written until the candidate is locked (sel_locked) and the DC
+            // blocker has settled, dropping the loud ADC start-up transient.
             int outn = 0;
             for (int i = 0; i < n; i++) {
                 dec_acc += extract_cand(stereo[i * 2], stereo[i * 2 + 1], sel);
@@ -271,10 +273,12 @@ static void rec_task(void *)
                     // y = x - x_prev + (255/256)*y_prev  -> ~5 Hz high-pass @16k
                     int32_t y = x - hp_xprev + (hp_yprev - (hp_yprev >> 8));
                     hp_xprev = x; hp_yprev = y;
-                    int v = y * REC_SW_GAIN;
-                    if (v >  32767) v =  32767;
-                    if (v < -32768) v = -32768;
-                    mono[outn++] = (int16_t)v;
+                    if (sel_locked) {           // skip warmup transient
+                        int v = y * REC_SW_GAIN;
+                        if (v >  32767) v =  32767;
+                        if (v < -32768) v = -32768;
+                        mono[outn++] = (int16_t)v;
+                    }
                     dec_acc = 0; dec_cnt = 0;
                 }
             }
