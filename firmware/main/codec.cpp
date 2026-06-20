@@ -327,8 +327,16 @@ void codec_enable_mic(bool en)
     // reg14: bit6 selects MIC input; keep LINEOUT bits from init (0x1A base)
     uint8_t reg = 0x1A;
     if (en) reg |= (1u << 6);
+    if (en) {
+        // Re-assert the full ADC analog power path so a recording never depends
+        // on leftover register state (after deep-sleep wake or playback the
+        // ES8311 has been observed with 0x0D=0x02, which mutes the ADC and
+        // yields digital silence). These four writes guarantee a live mic.
+        codec_write_reg(0x0D, 0x01); // power up analog circuitry
+        codec_write_reg(0x0E, 0x02); // enable analog PGA + ADC modulator
+    }
     codec_write_reg(0x17, 0xC8); // ADC volume
-    codec_write_reg(0x14, reg);
+    codec_write_reg(0x14, reg);  // mic select + analog output enable
 }
 
 void codec_set_mic_gain(uint8_t gain)

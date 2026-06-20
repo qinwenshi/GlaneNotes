@@ -161,6 +161,16 @@ static void i2s_stop(void)
     if (s_tx) { i2s_channel_disable(s_tx); i2s_del_channel(s_tx); s_tx = nullptr; }
 }
 
+// Delay in small slices so a recorder_stop() during startup priming is honored
+// promptly (bounds the abort latency, keeping recorder_stop()'s join wait safe).
+// Returns false if recording was stopped while waiting.
+static bool running_delay(uint32_t ms)
+{
+    for (uint32_t e = 0; e < ms && s_running; e += 20)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    return s_running;
+}
+
 // ── TX silence task: keep the shared clocks fed ──────────────────────────────
 static void tx_silence_task(void *)
 {
@@ -208,6 +218,64 @@ static void rec_task(void *)
     bool     hp_init     = false;
 
     if (stereo && mono) {
+        // ── Startup priming: settle analog, flush stale DMA, recover dead ADC ──
+        // The shared I2S0 clocks are already live (tx_silence_task), so the
+        // ES8311 analog path settles during this delay. Then flush any startup
+        // garbage from the RX DMA before measuring. If the mic reads as digital
+        // silence (intermittent 0x0D=0x02 dead-ADC state), re-assert codec power
+        // and bounce the I2S RX channel, then retry. This runs before any audio
+        // is written; the steady loop below never recovers mid-recording.
+        running_delay(REC_SETTLE_MS);
+        for (int attempt = 0; s_running && attempt <= REC_PRIME_RETRIES; attempt++) {
+            // Drain stale DMA frames (startup garbage / 0xFFFF rail) first.
+            for (int f = 0; f < 4 && s_running; f++) {
+                size_t g = 0;
+                i2s_channel_read(s_rx, stereo, in_bytes, &g, pdMS_TO_TICKS(100));
+            }
+            // Probe ~150 ms; measure max per-candidate AC (mean-removed) energy.
+            int64_t  psum[4] = {0,0,0,0}, psumsq[4] = {0,0,0,0};
+            uint32_t pn = 0;
+            const uint32_t target = (uint32_t)(REC_CAPTURE_RATE * 150 / 1000);
+            while (s_running && pn < target) {
+                size_t g = 0;
+                if (i2s_channel_read(s_rx, stereo, in_bytes, &g, pdMS_TO_TICKS(200)) != ESP_OK)
+                    continue;
+                int m = (int)(g / (2 * sizeof(uint32_t)));
+                for (int i = 0; i < m; i++) {
+                    uint32_t lw = stereo[i * 2], rw = stereo[i * 2 + 1];
+                    for (int c = 0; c < 4; c++) {
+                        int16_t s = extract_cand(lw, rw, c);
+                        psum[c]   += s;
+                        psumsq[c] += (int64_t)s * s;
+                    }
+                }
+                pn += (uint32_t)m;
+            }
+            if (!s_running) break;
+            uint32_t pns = pn ? pn : 1;
+            int64_t maxac = 0;
+            for (int c = 0; c < 4; c++) {
+                int64_t ac = psumsq[c] - (psum[c] / (int64_t)pns) * psum[c];
+                if (ac > maxac) maxac = ac;
+            }
+            int maxrms = (int)__builtin_sqrt((double)(maxac / pns));
+            if (maxrms >= REC_SILENCE_FLOOR) break;     // live mic -> proceed
+            if (attempt == REC_PRIME_RETRIES) {
+                ESP_LOGW(TAG, "mic still silent after %d recovery attempts; recording anyway",
+                         attempt);
+                break;
+            }
+            ESP_LOGW(TAG, "mic digital-silent (max AC RMS=%d) -> codec power + I2S resync (attempt %d)",
+                     maxrms, attempt + 1);
+            codec_enable_mic(true);                     // re-assert 0x0D/0x0E/0x17/0x14
+            i2s_channel_disable(s_rx);
+            running_delay(30);
+            i2s_channel_enable(s_rx);
+            running_delay(200);                         // let DMA refill with live data
+        }
+        // Diag raw snapshot should show the real recording, not flushed garbage.
+        s_raw_n = 0;
+
         while (s_running) {
             size_t got = 0;
             esp_err_t r = i2s_channel_read(s_rx, stereo, in_bytes, &got, pdMS_TO_TICKS(200));
@@ -442,8 +510,10 @@ void recorder_stop(void)
     if (!s_running && !s_file) return;
     s_running = false;
 
-    // Wait for both tasks to exit before touching shared resources.
-    if (s_rec_task) { xSemaphoreTake(s_rec_done, pdMS_TO_TICKS(1000)); s_rec_task = nullptr; }
+    // Wait for both tasks to exit before touching shared resources. The read
+    // task may be mid startup-priming (settle/probe/resync); its delays are
+    // sliced so it observes s_running==false within ~200 ms, but allow margin.
+    if (s_rec_task) { xSemaphoreTake(s_rec_done, pdMS_TO_TICKS(2000)); s_rec_task = nullptr; }
     if (s_tx_task)  { xSemaphoreTake(s_tx_done,  pdMS_TO_TICKS(1000)); s_tx_task  = nullptr; }
 
     i2s_stop();

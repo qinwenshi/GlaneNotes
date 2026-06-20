@@ -59,6 +59,18 @@
 #define REC_MAX_SECONDS   600     // hard cap (~19 MB) to avoid runaway files
 #define REC_SW_GAIN       8       // software gain for the quiet onboard mic
 
+// ── Capture startup priming (recover the intermittent dead-ADC case) ─────────
+// After deep-sleep wake or a playback session the ES8311 has been seen with its
+// analog power register (0x0D) drifted to 0x02, leaving the ADC delivering pure
+// digital silence. At record start we settle the analog path with clocks live,
+// flush stale DMA, then probe; if the mic is digital-silent we re-assert codec
+// power + bounce the I2S RX channel and retry. Runs only at startup, before any
+// audio is written — the steady capture loop never recovers mid-recording.
+#define REC_SETTLE_MS       250   // analog VMID/bias settle (clocks already live)
+#define REC_PRIME_RETRIES   3     // dead-ADC recovery attempts before giving up
+#define REC_SILENCE_FLOOR   16    // AC RMS below this on ALL candidates = dead ADC
+                                  // (a live mic noise floor measures ~64)
+
 // ── Filesystem layout ────────────────────────────────────────────────────────
 #define SD_MOUNT          "/sdcard"
 #define NOTES_DIR         "/sdcard/notes"
