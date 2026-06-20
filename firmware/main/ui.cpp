@@ -170,11 +170,11 @@ static void draw_idle_dog(int frame)
 // a fill proportional to `pct` (0..100). pct < 0 draws an empty "?" battery.
 static void battery_icon(int x, int y, int pct)
 {
-    const int w = 34, h = 16;          // body size
+    const int w = 26, h = 12;          // body size
     rect(x, y, x + w, y + h);          // outline
-    fill_rect(x + w + 1, y + 5, x + w + 3, y + h - 5);  // terminal nub
+    fill_rect(x + w + 1, y + 4, x + w + 2, y + h - 4);  // terminal nub
     if (pct < 0) {
-        draw_char(x + w / 2 - 3, y + 3, '?', 1);
+        draw_char(x + w / 2 - 3, y + 2, '?', 1);
         return;
     }
     int inner = w - 4;                 // fillable width
@@ -227,11 +227,11 @@ void ui_show_idle(int note_count, int wifi_connected, const char *ip, int batter
     s_epd->EPD_Clear();
 
     // Battery indicator, top-RIGHT, with the percentage text to its left.
-    battery_icon(155, 6, battery_pct);
+    battery_icon(162, 6, battery_pct);
     if (battery_pct >= 0) {
         char b[16];
         snprintf(b, sizeof(b), "%d%%", battery_pct);
-        draw_text_right(150, 8, b, 1);
+        draw_text_right(157, 7, b, 1);
     }
 
     draw_text_centered(24, "GLANE NOTES", 2);
