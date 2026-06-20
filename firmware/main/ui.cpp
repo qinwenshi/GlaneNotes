@@ -170,9 +170,9 @@ static void draw_idle_dog(int frame)
 // a fill proportional to `pct` (0..100). pct < 0 draws an empty "?" battery.
 static void battery_icon(int x, int y, int pct)
 {
-    const int w = 26, h = 12;          // body size
+    const int w = 26, h = 8;           // body size (shorter)
     rect(x, y, x + w, y + h);          // outline
-    fill_rect(x + w + 1, y + 4, x + w + 2, y + h - 4);  // terminal nub
+    fill_rect(x + w + 1, y + h / 2 - 1, x + w + 2, y + h / 2 + 1);  // terminal nub
     if (pct < 0) {
         draw_char(x + w / 2 - 3, y + 2, '?', 1);
         return;
