@@ -9,8 +9,8 @@
 把 **微雪 Waveshare ESP32-S3-ePaper-1.54** 开发板变成一台极简、零干扰、带电子墨水屏的
 语音备忘设备。灵感来自 "Pala Note" 项目，核心理念只有一个：*先捕捉，后处理*。
 
-长按按键即可把语音直接录到 SD 卡（WAV 格式）；松手立即保存并响起提示音，随后回到
-超低功耗深睡。当你主动通过 Wi-Fi 同步时，录音会用 **阿里云百炼 DashScope
+**按下按键** 即可把语音直接录到 SD 卡（WAV 格式）；**再按一次** 立即保存并响起提示音，
+随后回到超低功耗深睡。当你主动通过 Wi-Fi 同步时，录音会用 **阿里云百炼 DashScope
 `qwen3-asr-flash`** 转写成可搜索的文字，并写回到音频旁边。设备本机列表或内置的小型
 Web 控制台都能浏览、回放、导出全部笔记。
 
@@ -42,8 +42,8 @@ ES8311 音频编解码. -->
 
 ## 🎬 工作流程
 
-1. **长按 BOOT** → 开始录音（上升提示音），开口说出你的笔记。
-2. **松手 / 再按一次** → 以 16 kHz 单声道 WAV 保存到 `/sdcard/notes/`（下降提示音），
+1. **按下 BOOT** → 开始录音（上升提示音），开口说出你的笔记。
+2. **再按一次 BOOT** → 以 16 kHz 单声道 WAV 保存到 `/sdcard/notes/`（下降提示音），
    随后回到低功耗主界面。
 3. **按 PWR** → 打开本机笔记列表；**BOOT** 打开某条笔记，**再按 BOOT** 通过扬声器回放。
 4. **长按 BOOT** → 通过 Wi-Fi 同步：每条未转写的笔记都会上传到 DashScope，并把 `.txt`
@@ -66,31 +66,163 @@ ES8311 音频编解码. -->
 
 完整引脚定义见 [`firmware/main/glane_config.h`](firmware/main/glane_config.h)。
 
-## 🚀 构建与烧录
+## 🚀 构建、烧录与监视
 
-需要 **ESP-IDF v5.5+**。脚本会自动加载 ESP-IDF 环境并自动探测串口：
+需要 **ESP-IDF v5.5+** 与 ESP32-S3 目标芯片。[`firmware/scripts/`](firmware/scripts/)
+下的脚本会自动加载 ESP-IDF 环境并自动探测串口。
 
 ```bash
 cd firmware
-./scripts/build.sh        # 首次会设置目标芯片，然后构建
-./scripts/flash.sh        # 通过 USB 烧录（自动探测端口）
-./scripts/monitor.sh      # 串口监视器
+
+# 构建
+./scripts/build.sh              # 首次会设置目标芯片，然后构建
+./scripts/build.sh clean        # idf.py fullclean 后再构建
+./scripts/build.sh fullclean    # 删除 build/ 后再构建
+
+# 烧录
+./scripts/flash.sh              # 构建 + 烧录（自动探测端口）
+./scripts/flash.sh --monitor    # 烧录后打开串口监视器
+./scripts/flash.sh -p /dev/cu.usbmodemXXXX
+
+# 监视器（Ctrl-] 退出）
+./scripts/monitor.sh
 ```
 
-完整的构建、烧录、配置、Web 控制台与架构文档见
-[`firmware/README.md`](firmware/README.md)（英文）。
+可用环境变量覆盖 ESP-IDF 路径或串口：
+
+```bash
+IDF_DIR=/path/to/esp-idf ./scripts/build.sh
+PORT=/dev/cu.usbmodem1101 ./scripts/flash.sh
+```
+
+或直接用原生 `idf.py`：
+
+```bash
+source /path/to/esp-idf/export.sh
+cd firmware
+idf.py set-target esp32s3        # 仅首次
+idf.py build
+idf.py -p /dev/cu.usbmodemXXXX flash monitor
+```
+
+设备以 USB CDC 串口（USB-Serial-JTAG）枚举。若深睡后串口消失，重新执行
+`ls /dev/cu.usbmodem*` 并把新端口传给 `flash.sh -p`。
 
 ## ⚙️ 首次配置
 
-固件不内置任何 Wi-Fi 或 API Key。首次开机时设备会开启 `GlaneNotes-Setup` 热点：
+固件不内置任何 Wi-Fi 或 API Key，全部存于 NVS，由内置 Web 控制台设置。首次开机
+（尚未保存 Wi-Fi）时设备会自动开启 **配网热点**：
 
-1. 用手机连接 **`GlaneNotes-Setup`**（开放网络，无需密码）。
-2. 浏览器打开 **`http://192.168.4.1`**。
-3. 填入你的 **Wi-Fi 名称 + 密码** 与 **阿里云 DashScope API Key**，点击保存。
-4. 设备重启并连入你的网络，即可开始同步。
+1. 开机，屏幕显示 **WIFI SETUP** 与 SSID、网址。
+2. 用手机连接 **`GlaneNotes-Setup`**（开放网络，无需密码）。
+3. 浏览器打开 **`http://192.168.4.1`**，进入设置页。
+4. 填入 **Wi-Fi 名称 + 密码** 与 **阿里云 DashScope API Key**，点击保存。
+5. 设备显示 **SAVED / Restarting** 并重启连入你的网络。
+
+之后想重新配网：在主界面 **长按 BOOT** 触发同步；若未配置 Wi-Fi 会重新打开配网热点。
+按任意键可取消。
 
 你需要一个 [阿里云百炼](https://bailian.console.aliyun.com/) 的 API Key，并开通
 `qwen3-asr-flash` 语音识别模型的访问权限。
+
+> **离线优先：** Wi-Fi 永不阻塞开机。已保存凭据时设备在后台连接；即使连接失败，
+> 录音、列表、回放仍完全离线可用，同步只会提示 *Working offline*。
+
+## 📖 操作指南
+
+两个按键（**BOOT** 与 **PWR**）驱动一个小型状态机；每次按键的功能取决于当前界面。
+**长按** 指按住约 0.8 秒，更短即为 **短按**。
+
+### 主界面（空闲）
+
+| 操作 | 结果 |
+|---|---|
+| **短按 BOOT** | 开始录音（上升提示音）。再按一次停止并保存。 |
+| **长按 BOOT** | 通过 Wi-Fi 同步（转写所有未转写的笔记） |
+| **短按 PWR** | 打开本机笔记列表 |
+| **长按 PWR** | 立即进入深睡 |
+| 空闲约 3 分钟 | 自动深睡；按 BOOT 唤醒 |
+
+主界面左上角显示 **电量指示**（图标 + 百分比）、笔记数量与 Wi-Fi 状态（连接后显示设备 IP）。
+
+### 录音中
+
+| 操作 | 结果 |
+|---|---|
+| **按 BOOT 或 PWR** | 停止并保存录音（下降提示音） |
+
+录音为 16 kHz 单声道 WAV，单文件硬上限 **10 分钟**。录音计时通过快速局部刷新实时显示。
+停止为非阻塞——SD 写入在后台完成，界面立即返回主界面。
+
+### 笔记列表
+
+| 操作 | 结果 |
+|---|---|
+| **短按 PWR** | 选择光标下移（到底回到顶部） |
+| **短按 BOOT** | 打开所选笔记的详情 |
+| **长按 BOOT** | 返回主界面 |
+| **长按 PWR** | 深睡 |
+
+笔记按最新在前排列。每行显示编号，以及——在通过 Wi-Fi 校时（SNTP）之后——录音的
+日期时间（`MM-DD HH:MM`）；首次同步前显示为 `--:--`。
+
+### 笔记详情
+
+| 操作 | 结果 |
+|---|---|
+| **短按 BOOT** | 通过扬声器回放录音 |
+| **短按 PWR** | 返回笔记列表 |
+| **长按 BOOT** | 返回主界面 |
+
+### 回放中
+
+| 操作 | 结果 |
+|---|---|
+| **按 BOOT 或 PWR** | 停止回放 |
+| （回放结束） | 自动返回详情界面 |
+
+### 🖥️ Web 控制台
+
+连入 Wi-Fi 后，设备在其 IP 地址上提供控制台：
+
+| 路由 | 用途 |
+|---|---|
+| `/` | 笔记列表（含大小与转写状态） |
+| `/note?id=...` | 查看文字稿 |
+| `/dl?id=...` | 下载 WAV |
+| `/del?id=...` | 删除笔记（连同文字稿） |
+| `/settings` | 设置 Wi-Fi 凭据与 DashScope API Key |
+| `/sync` | 请求同步（立即返回，空闲时执行） |
+
+墨水屏仅显示英文状态；中文（或任意语言）文字稿可在 Web 控制台与 SD 卡上的 `.txt`
+文件中查看。
+
+### 🗃️ SD 卡目录结构
+
+```
+/sdcard/notes/
+├── note-0000000001.wav            # 录音（16 kHz 单声道）
+├── note-0000000001.txt            # 文字稿（同步后写入）
+└── note-0000000001.wav.diag.txt   # 采集诊断信息
+```
+
+要在电脑上读取录音或诊断，请从设备取出 SD 卡并挂载到电脑。卡取出期间设备会显示
+**SD mount fail**。
+
+## 🛠️ 故障排查
+
+| 现象 | 可能原因 / 处理 |
+|---|---|
+| 开机 **SD mount fail** | 卡未插好（或还在电脑里）。重新插入并重启。 |
+| **回放无声** | 检查串口日志是否有 `ES8311 init OK`；查看该笔记的 `.diag.txt`（各候选 AC RMS 接近 0 即无麦克风数据）。 |
+| **录音变快 / 变声** | 查看该笔记的 `.diag.txt`：`i2s_read_rate` 应约 48000，`ratio` 约 1.0。 |
+| **时长比计时短** | 检查 `.diag.txt` 里 `ring_drops`（应为 0）与 `i2s_read_rate`（约 48000）。 |
+| 同步提示 **Working offline** | Wi-Fi 未连接；在 `/settings` 检查凭据。录音/列表/回放仍可用。 |
+| **同步后文字稿为空** | DashScope 鉴权/额度问题，或文件超过 3 MB 内联上限（约 90 秒）。检查 API Key 与录音时长。 |
+| **串口消失** | 设备深睡并重新枚举 USB。重新执行 `ls /dev/cu.usbmodem*`。 |
+
+更深入的技术文档（硬件引脚表、DashScope 请求格式、采集/DSP 流水线、诊断字段、完整模块
+图）见 [`firmware/README.md`](firmware/README.md)（英文）。
 
 ## 🗂️ 项目结构
 

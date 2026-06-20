@@ -28,9 +28,20 @@ All pins are defined in [`main/glane_config.h`](main/glane_config.h).
 
 ## Recording format
 
-16 kHz · 16-bit · mono WAV. The codec and the I2S mic capture both run at
-16 kHz so no resampling is needed. Files are stored at `/sdcard/notes/note-<ts>.wav`
-and transcripts at `/sdcard/notes/note-<ts>.txt`.
+**16 kHz · 16-bit · mono WAV**, stored at `/sdcard/notes/note-<ts>.wav` with
+transcripts at `/sdcard/notes/note-<ts>.txt`.
+
+Internally the mic is **captured at 48 kHz** (32-bit I2S slots) and **decimated
+3:1 to 16 kHz** in software with a 23-tap anti-aliasing FIR, then DC-blocked. The
+ES8311 + I2S run cleanly at 48 kHz, and 48 k→16 k gives a far better stopband
+than capturing at 16 kHz directly, avoiding the aliasing/"voice-changer"
+artifacts seen with naive decimation. The capture loop pushes samples into a
+256 KB PSRAM ring buffer that a **dedicated writer task** drains to the SD card,
+so SD latency never stalls the I2S reader (which would drop samples).
+
+Each WAV gets a sibling `note-<ts>.wav.diag.txt` capture diagnostic (sample
+rate, `i2s_read_rate`, timing ratio, per-candidate levels, ES8311 register dump)
+to debug audio issues straight from the SD card without a serial console.
 
 ## Audio feedback
 
@@ -189,7 +200,7 @@ note count and Wi-Fi status.
 
 The e-paper uses **fast partial refresh** for in-screen updates (recording timer,
 list cursor movement) and only performs a **full flash refresh** when switching
-between different screen kinds or every 30 partial updates (to clear ghosting).
+between different screen kinds or every 60 partial updates (to clear ghosting).
 This keeps the UI feeling responsive while preventing artifact build-up.
 
 The e-ink screen shows English status text (idle / recording / syncing / messages).
@@ -213,7 +224,7 @@ When connected to Wi-Fi the device serves a dashboard on its IP:
 |---|---|
 | `glane_config.h` | All pins & constants (single source of truth) |
 | `app_main.cpp` | Power init + state machine (IDLE / RECORDING / SYNCING / LIST / DETAIL / PLAYING / PROVISION) |
-| `recorder.cpp` | Mic WAV capture (I2S0 master TX silence + I2S1 slave RX) |
+| `recorder.cpp` | Mic WAV capture (single I2S0 **master, RX-only** at 48 kHz → FIR decimate → 16 kHz; PSRAM ring + background writer/finalize) |
 | `player.cpp` | WAV playback through the speaker (I2S0 TX + ES8311 DAC) |
 | `tone.cpp` | Record start/stop feedback tones via ES8311 DAC |
 | `battery.cpp` | Battery voltage via ADC1_CH3 (GPIO4) + on-chip calibration |
@@ -236,8 +247,32 @@ from the `ESP32-S3-EPaper-Player/player_idf` reference project for the same boar
 - Note IDs come from a persistent NVS counter (`settings_next_note_seq`), unique
   across reboots and power cycles. Recording dates require an SNTP sync; before
   the first Wi-Fi sync the clock is unset and the list shows `--:--`.
-- The dual-controller full-duplex mic path (I2S0 + I2S1) and the DashScope inline
-  base64 upload are correctness-by-construction; verify on real hardware.
-- The DAC feedback-tone path (`tone.cpp`) is likewise unverified on hardware —
-  check tone volume / PA pop behaviour and adjust `TONE_AMPLITUDE` if needed.
+- The mic path is a single **I2S0 master, RX-only** channel that generates its
+  own MCLK/BCLK/WS and reads the mic directly — no TX silence feeder and no
+  second I2S controller, which removes the cross-controller frame-sync drift that
+  earlier caused intermittent silent / sped-up ("voice-changer") recordings.
+- The DAC feedback-tone path (`tone.cpp`) — check tone volume / PA pop behaviour
+  and adjust `TONE_AMPLITUDE` if needed.
 - No LVGL — the UI draws directly into the e-ink buffer via `epaper_bsp`.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| **SD mount fail** on boot | Card not seated, or it's in your Mac. Re-insert the microSD and reboot. |
+| **Recording plays back silent** | Mic/PA power rail or codec init. Check the serial log for `ES8311 init OK`; inspect the note's `.diag.txt` — a near-zero AC RMS on every candidate means no real mic data. |
+| **Recording sounds sped-up / "voice-changer"** | I2S clocking. Open the note's `.diag.txt`: `i2s_read_rate` should be ≈ 48000 and `ratio`/`cap_ratio` ≈ 1.0. A clean half-rate (~24000, ratio ≈ 2.0) points to an I2S slot/`ws_width` mismatch; a low *and* variable rate points to frame-sync loss. |
+| **Recorded length shorter than the on-screen timer** | Dropped samples. Check `ring_drops` (want 0) and that `i2s_read_rate` ≈ 48000 in the `.diag.txt`. |
+| **Sync says "Working offline"** | Wi-Fi not connected. Verify credentials in `/settings`; sync is skipped (recording/list/playback still work). |
+| **Transcript empty after sync** | DashScope auth/quota, or the file exceeds the 3 MB inline cap (~90 s). Check the API key and recording length. |
+| **Serial port disappears** | The board sleeps and re-enumerates USB. Re-check `ls /dev/cu.usbmodem*` and pass the new port to `flash.sh -p`. |
+
+### Capture diagnostics (`note-<ts>.wav.diag.txt`)
+
+Written next to every recording so you can debug audio from the SD card alone:
+
+- `i2s_read_rate` — frames/s the reader actually pulled from I2S; **want ≈ 48000**.
+- `ratio` / `cap_ratio` — expected-vs-actual duration; **want ≈ 1.0**.
+- `ring_drops` — samples dropped because the PSRAM ring was full; **want 0**.
+- per-candidate **AC RMS / mean / ghost%** — high/low 16-bit word auto-detect levels.
+- a raw I2S frame dump + an ES8311 register snapshot taken at stop time.

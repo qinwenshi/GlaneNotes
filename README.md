@@ -11,7 +11,7 @@ firmware that turns a **Waveshare ESP32-S3-ePaper-1.54** board into a tiny,
 distraction-free voice memo device with an e-ink display. Inspired by the
 "Pala Note" project, it is designed around one idea: *capture now, process later*.
 
-Hold a button to record straight to the SD card as WAV; let go and it saves
+Press a button to record straight to the SD card as WAV; press again and it saves
 instantly with an audible cue, then drops back into ultra-low-power deep sleep.
 When you choose to sync over Wi-Fi, recordings are transcribed to searchable text
 using **Aliyun DashScope (Bailian) `qwen3-asr-flash`** and written back next to
@@ -54,8 +54,8 @@ second brain device, DIY voice recorder, SSD1681 e-paper, ES8311 codec. -->
 
 ## 🎬 How it works
 
-1. **Hold BOOT** → recording starts (rising tone). Speak your note.
-2. **Release / press again** → saves to `/sdcard/notes/` as 16 kHz mono WAV
+1. **Press BOOT** → recording starts (rising tone). Speak your note.
+2. **Press BOOT again** → saves to `/sdcard/notes/` as 16 kHz mono WAV
    (falling tone), then returns to the low-power home screen.
 3. **Press PWR** → open the on-device notes list; **BOOT** opens a note,
    **BOOT again** plays it through the speaker.
@@ -80,33 +80,173 @@ Target board: **Waveshare ESP32-S3-ePaper-1.54** (ESP32-S3-PICO-1, dual-core
 
 Full pin map: [`firmware/main/glane_config.h`](firmware/main/glane_config.h).
 
-## 🚀 Build & flash
+## 🚀 Build, flash & monitor
 
-Requires **ESP-IDF v5.5+**. Convenience scripts auto-source ESP-IDF and
-auto-detect the serial port:
+Requires **ESP-IDF v5.5+** and an ESP32-S3 target. The convenience scripts in
+[`firmware/scripts/`](firmware/scripts/) auto-source ESP-IDF and auto-detect the
+serial port.
 
 ```bash
 cd firmware
-./scripts/build.sh        # set-target (first run) + build
-./scripts/flash.sh        # flash over USB (auto-detect port)
-./scripts/monitor.sh      # serial monitor
+
+# Build
+./scripts/build.sh              # set-target (first run) + build
+./scripts/build.sh clean        # idf.py fullclean, then build
+./scripts/build.sh fullclean    # rm -rf build/, then build
+
+# Flash
+./scripts/flash.sh              # build + flash (auto-detect port)
+./scripts/flash.sh --monitor    # flash, then open the serial monitor
+./scripts/flash.sh -p /dev/cu.usbmodemXXXX
+
+# Monitor (Ctrl-] to quit)
+./scripts/monitor.sh
 ```
 
-See [`firmware/README.md`](firmware/README.md) for the full build, flashing,
-configuration, web dashboard, and architecture documentation.
+Override the ESP-IDF location or port via env vars:
+
+```bash
+IDF_DIR=/path/to/esp-idf ./scripts/build.sh
+PORT=/dev/cu.usbmodem1101 ./scripts/flash.sh
+```
+
+Or use plain `idf.py`:
+
+```bash
+source /path/to/esp-idf/export.sh
+cd firmware
+idf.py set-target esp32s3        # first time only
+idf.py build
+idf.py -p /dev/cu.usbmodemXXXX flash monitor
+```
+
+The board enumerates as a USB CDC serial device (console over USB-Serial-JTAG).
+If the port disappears after the device deep-sleeps, re-check
+`ls /dev/cu.usbmodem*` and pass the new port to `flash.sh -p`.
 
 ## ⚙️ First-time configuration
 
-No Wi-Fi or API key is hard-coded. On first boot the device opens the
-`GlaneNotes-Setup` Wi-Fi hotspot:
+No Wi-Fi or API key is hard-coded — everything is stored in NVS and set from the
+built-in web dashboard. On first boot (no Wi-Fi saved) the device auto-hosts a
+**setup access point**:
 
-1. Join **`GlaneNotes-Setup`** from your phone (open network).
-2. Open **`http://192.168.4.1`** in a browser.
-3. Enter your **Wi-Fi SSID + password** and **Aliyun DashScope API key**, then Save.
-4. The device reboots onto your network and is ready to sync.
+1. Power on. The screen shows **WIFI SETUP** with an SSID and URL.
+2. From your phone, join **`GlaneNotes-Setup`** (open network, no password).
+3. Open **`http://192.168.4.1`** in a browser — the Settings page opens.
+4. Enter your **Wi-Fi SSID + password** and **Aliyun DashScope API key**, then Save.
+5. The device shows **SAVED / Restarting** and reboots onto your network.
+
+To re-enter setup later: from the home screen **hold BOOT** to sync; if no Wi-Fi
+is configured it reopens the setup AP. Press any button to cancel.
 
 You need an [Aliyun Bailian (百炼)](https://bailian.console.aliyun.com/) API key
 with access to the `qwen3-asr-flash` speech-recognition model.
+
+> **Offline-first:** Wi-Fi never blocks startup. With credentials saved the
+> device connects in the background; if it fails, recording, list, and playback
+> keep working fully offline — sync simply reports *Working offline*.
+
+## 📖 Operating guide
+
+Two buttons (**BOOT** and **PWR**) drive a small state machine; what each press
+does depends on the current screen. A **long-press** is a hold (~0.8 s); anything
+shorter is a short-press.
+
+### Home (idle)
+
+| Action | Result |
+|---|---|
+| **Short-press BOOT** | Start recording (rising tone). Press again to stop & save. |
+| **Long-press BOOT** | Sync over Wi-Fi (transcribe all un-transcribed notes) |
+| **Short-press PWR** | Open the on-device notes list |
+| **Long-press PWR** | Enter deep sleep immediately |
+| Idle ~3 min | Auto deep sleep; press BOOT to wake |
+
+The home screen shows a **battery indicator** (icon + %) top-left, the note count,
+and Wi-Fi status (and the device IP once connected).
+
+### Recording
+
+| Action | Result |
+|---|---|
+| **Press BOOT or PWR** | Stop and save the recording (falling tone) |
+
+Recordings are 16 kHz mono WAV, hard-capped at **10 minutes** per file. A live
+timer is shown via fast partial refresh. The stop is non-blocking — the SD write
+finalizes in the background so the UI returns home immediately.
+
+### Notes list
+
+| Action | Result |
+|---|---|
+| **Short-press PWR** | Move the selection cursor down (wraps to top) |
+| **Short-press BOOT** | Open the selected note's detail screen |
+| **Long-press BOOT** | Back to the home screen |
+| **Long-press PWR** | Deep sleep |
+
+Notes are shown newest-first. Each row shows its number and — once the clock has
+been set over Wi-Fi (SNTP) — the recording date/time (`MM-DD HH:MM`); before the
+first sync it shows `--:--`.
+
+### Note detail
+
+| Action | Result |
+|---|---|
+| **Short-press BOOT** | Play the recording through the speaker |
+| **Short-press PWR** | Back to the notes list |
+| **Long-press BOOT** | Back to the home screen |
+
+### Playing
+
+| Action | Result |
+|---|---|
+| **Press BOOT or PWR** | Stop playback |
+| (playback finishes) | Returns automatically to the detail screen |
+
+### 🖥️ Web dashboard
+
+When connected to Wi-Fi the device serves a dashboard at its IP address:
+
+| Route | Purpose |
+|---|---|
+| `/` | List notes with size & transcript status |
+| `/note?id=...` | View a transcript |
+| `/dl?id=...` | Download the WAV |
+| `/del?id=...` | Delete a note (and its transcript) |
+| `/settings` | Set Wi-Fi credentials & DashScope API key |
+| `/sync` | Request a sync (returns immediately; runs when idle) |
+
+The e-ink screen shows English status only; Chinese (or any) transcripts are
+viewable in the web dashboard and the `.txt` files on the SD card.
+
+### 🗃️ SD card layout
+
+```
+/sdcard/notes/
+├── note-0000000001.wav            # recording (16 kHz mono)
+├── note-0000000001.txt            # transcript (written after sync)
+└── note-0000000001.wav.diag.txt   # capture diagnostics
+```
+
+To read recordings or diagnostics on a computer, eject the card from the device
+and mount it on your Mac/PC. The device shows **SD mount fail** while the card is
+removed.
+
+## 🛠️ Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| **SD mount fail** on boot | Card not seated (or it's in your computer). Re-insert and reboot. |
+| **Recording plays back silent** | Check the serial log for `ES8311 init OK`; inspect the note's `.diag.txt` (near-zero AC RMS = no mic data). |
+| **Recording sounds sped-up** | Open the note's `.diag.txt`: `i2s_read_rate` should be ≈ 48000 and `ratio` ≈ 1.0. |
+| **Length shorter than the timer** | Check `ring_drops` (want 0) and `i2s_read_rate` ≈ 48000 in `.diag.txt`. |
+| **Sync says "Working offline"** | Wi-Fi not connected; check credentials in `/settings`. Recording/list/playback still work. |
+| **Empty transcript after sync** | DashScope auth/quota, or file > 3 MB inline cap (~90 s). Check the API key & length. |
+| **Serial port disappears** | Board slept and re-enumerated USB. Re-check `ls /dev/cu.usbmodem*`. |
+
+See [`firmware/README.md`](firmware/README.md) for the deep technical
+documentation: hardware pin map, the DashScope request format, the capture/DSP
+pipeline, the diagnostic sidecar fields, and the full module map.
 
 ## 🗂️ Project structure
 
