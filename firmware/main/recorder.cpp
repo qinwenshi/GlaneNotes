@@ -48,6 +48,7 @@ static FILE             *s_file    = nullptr;
 static volatile uint32_t s_data_bytes = 0;        // PCM bytes actually written to SD
 static volatile uint32_t s_prod_bytes = 0;        // PCM bytes produced by capture loop
 static int64_t           s_start_us   = 0;
+static int64_t           s_capture_start_us = 0;   // set when steady capture begins (post-priming)
 static char              s_path[128]  = {0};   // current recording path (for diag sidecar)
 
 // Decoupled SD writer: the capture loop pushes decimated 16k samples into this
@@ -115,10 +116,14 @@ static void write_wav_header(FILE *f, uint32_t data_len)
 // ── I2S bring-up ─────────────────────────────────────────────────────────────
 static bool i2s_start(void)
 {
-    // I2S0 master TX — generates MCLK/BCLK/WS for the codec.
+    // I2S0 master TX — generates MCLK/BCLK/WS for the codec. Large DMA so the
+    // shared master clock keeps running even if the silence feeder is briefly
+    // starved (WiFi/SD jitter); a TX underrun gaps BCLK/WS and the slave RX then
+    // loses frames (capture comes out short -> plays back too fast).
     i2s_chan_config_t tx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    tx_cfg.dma_desc_num  = 6;
-    tx_cfg.dma_frame_num = 240;
+    tx_cfg.dma_desc_num  = 8;
+    tx_cfg.dma_frame_num = 512;       // 8 x 512 = ~85 ms of clock slack @48k
+    tx_cfg.auto_clear    = true;      // emit zeros (not stale data) on underrun
     if (i2s_new_channel(&tx_cfg, &s_tx, nullptr) != ESP_OK) return false;
 
     i2s_std_config_t tx_std = {
@@ -135,12 +140,21 @@ static bool i2s_start(void)
         },
     };
     if (i2s_channel_init_std_mode(s_tx, &tx_std) != ESP_OK) return false;
+    // Preload the TX DMA with silence so the master clock starts with a full
+    // buffer of zeros to clock out (extra underrun margin at startup).
+    {
+        static int32_t z[256] = {0};
+        size_t loaded = 0, total = 0;
+        while (i2s_channel_preload_data(s_tx, z, sizeof(z), &loaded) == ESP_OK && loaded > 0)
+            total += loaded;
+    }
     if (i2s_channel_enable(s_tx) != ESP_OK) return false;
 
-    // I2S1 slave RX — mic capture, shares I2S0 BCLK/WS.
+    // I2S1 slave RX — mic capture, shares I2S0 BCLK/WS. Generous DMA so a brief
+    // reader stall doesn't overflow and drop captured frames.
     i2s_chan_config_t rx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
     rx_cfg.dma_desc_num  = 8;
-    rx_cfg.dma_frame_num = 256;
+    rx_cfg.dma_frame_num = 512;       // ~85 ms RX slack @48k
     if (i2s_new_channel(&rx_cfg, nullptr, &s_rx) != ESP_OK) return false;
 
     i2s_std_config_t rx_std = {
@@ -186,7 +200,7 @@ static bool running_delay(uint32_t ms)
 // ── TX silence task: keep the shared clocks fed ──────────────────────────────
 static void tx_silence_task(void *)
 {
-    const int N = 240;                 // frames per write
+    const int N = 512;                 // frames per write (match TX dma_frame_num)
     size_t  bytes = N * 2 * sizeof(int32_t);
     int32_t *zeros = (int32_t *)heap_caps_calloc(1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (zeros) {
@@ -305,6 +319,7 @@ static void rec_task(void *)
         }
         // Diag raw snapshot should show the real recording, not flushed garbage.
         s_raw_n = 0;
+        s_capture_start_us = esp_timer_get_time();   // steady capture starts now
 
         while (s_running) {
             size_t got = 0;
@@ -529,10 +544,14 @@ bool recorder_start(const char *vfs_path)
     xSemaphoreTake(s_tx_done, 0);
     xSemaphoreTake(s_rec_done, 0);
     xSemaphoreTake(s_write_done, 0);
-    // Writer on core 0 (with TX silence); tight reader alone on core 1.
+    // Clock feeder (tx) and reader (rx) are real-time critical for a gap-free
+    // master clock and overflow-free capture: pin BOTH to core 1, away from the
+    // WiFi/LWIP stack and the SD writer (core 0) which would otherwise starve the
+    // feeder, gap the I2S clock, and drop captured frames. Writer tolerates core-0
+    // contention because the 256 KB ring absorbs SD stalls.
     BaseType_t ok = pdPASS;
     ok &= xTaskCreatePinnedToCore(write_task,      "rec_wr", 4096, nullptr, 5, &s_write_task, 0);
-    ok &= xTaskCreatePinnedToCore(tx_silence_task, "rec_tx", 3072, nullptr, 4, &s_tx_task, 0);
+    ok &= xTaskCreatePinnedToCore(tx_silence_task, "rec_tx", 3072, nullptr, 6, &s_tx_task, 1);
     ok &= xTaskCreatePinnedToCore(rec_task,        "rec_rd", 4096, nullptr, 6, &s_rec_task, 1);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "task create failed — aborting recording");
@@ -593,10 +612,19 @@ static void write_diag_sidecar(void)
     // plays back too fast (the "voice-changer" artifact).
     {
         double wall_s  = (double)(esp_timer_get_time() - s_start_us) / 1e6;
+        double cap_s   = s_capture_start_us
+                         ? (double)(esp_timer_get_time() - s_capture_start_us) / 1e6 : 0;
         double audio_s = (double)s_data_bytes /
                          ((double)REC_SAMPLE_RATE * REC_CHANNELS * (REC_BITS / 8));
-        fprintf(d, "timing         : wall=%.2fs audio=%.2fs ratio=%.2f (1.00=no drops)\n",
-                wall_s, audio_s, audio_s > 0 ? wall_s / audio_s : 0.0);
+        // Frames the I2S actually delivered during steady capture vs the nominal
+        // 48k rate: <48k means the master clock gapped / RX DMA overflowed.
+        double read_hz = cap_s > 0 ? (double)s_cand_samples / cap_s : 0;
+        fprintf(d, "timing         : wall=%.2fs capture=%.2fs audio=%.2fs ratio=%.2f (cap_ratio=%.2f, 1.00=ok)\n",
+                wall_s, cap_s, audio_s,
+                audio_s > 0 ? wall_s / audio_s : 0.0,
+                audio_s > 0 ? cap_s  / audio_s : 0.0);
+        fprintf(d, "i2s_read_rate  : %.0f frames/s (expect %d; lower = clock gap/DMA overflow)\n",
+                read_hz, REC_CAPTURE_RATE);
         fprintf(d, "ring_drops     : %u bytes produced=%u written=%u\n",
                 (unsigned)s_ring_drops, (unsigned)s_prod_bytes, (unsigned)s_data_bytes);
     }
