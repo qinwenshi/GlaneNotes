@@ -57,7 +57,9 @@
 #define REC_BITS          16
 #define REC_CHANNELS      1
 #define REC_MAX_SECONDS   600     // hard cap (~19 MB) to avoid runaway files
-#define REC_SW_GAIN       8       // software gain for the quiet onboard mic
+#define REC_SW_GAIN       2       // software gain (analog PGA does the heavy lift)
+#define REC_MIC_PGA_GAIN  4       // ES8311 analog PGA gain 0-7 (lower = headroom,
+                                  // avoids ADC-stage clipping that sounds harsh)
 
 // ── Capture startup priming (recover the intermittent dead-ADC case) ─────────
 // After deep-sleep wake or a playback session the ES8311 has been seen with its
