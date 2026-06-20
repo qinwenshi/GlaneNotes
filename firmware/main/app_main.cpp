@@ -36,7 +36,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <utime.h>
 
 static const char *TAG = "glane";
 
@@ -231,15 +230,12 @@ static void start_recording(void)
 
 static void stop_recording(void)
 {
-    recorder_stop();
-    // Stamp the file with the real time if the clock is set, so the notes list
-    // can show a date. (FAT mtime is otherwise 1980 until SNTP has run.)
-    if (timesync_is_valid() && s_rec_path[0]) {
-        struct utimbuf ut;
-        ut.actime = ut.modtime = time(nullptr);
-        utime(s_rec_path, &ut);
-    }
-    tone_play_stop();    // audible cue once I2S0 is free again
+    // Hand the desired file mtime to the recorder so the background finalize can
+    // stamp it after the WAV is closed (FAT mtime is otherwise 1980 until SNTP).
+    if (timesync_is_valid())
+        recorder_set_save_time((int64_t)time(nullptr));
+    recorder_stop();     // returns fast; SD flush/close finishes in the background
+    tone_play_stop();    // audible cue — I2S0 is freed synchronously by recorder_stop()
     s_state = State::IDLE;
     s_last_activity = millis();
     ui_show_message("SAVED", "Note stored on SD");
@@ -253,6 +249,7 @@ static void enter_deep_sleep(void)
     ESP_LOGI(TAG, "entering deep sleep");
     if (player_is_active()) player_stop();
     if (recorder_is_active()) recorder_stop();
+    recorder_wait_finalized(8000);   // ensure the WAV is fully written before the SD rail drops
     webserver_stop();
     wifi_mgr_disconnect();
     ui_show_message("SLEEPING", "Press to wake");

@@ -32,6 +32,8 @@
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <utime.h>
 
 extern "C" {
 #include "driver/i2s_std.h"
@@ -40,8 +42,7 @@ extern "C" {
 
 static const char *TAG = "recorder";
 
-static i2s_chan_handle_t s_tx = nullptr;  // I2S0 master (clock source, silence)
-static i2s_chan_handle_t s_rx = nullptr;  // I2S1 slave  (mic capture)
+static i2s_chan_handle_t s_rx = nullptr;  // I2S0 master RX: generates MCLK/BCLK/WS and captures mic
 
 static volatile bool     s_running = false;
 static FILE             *s_file    = nullptr;
@@ -49,6 +50,7 @@ static volatile uint32_t s_data_bytes = 0;        // PCM bytes actually written 
 static volatile uint32_t s_prod_bytes = 0;        // PCM bytes produced by capture loop
 static int64_t           s_start_us   = 0;
 static int64_t           s_capture_start_us = 0;   // set when steady capture begins (post-priming)
+static int64_t           s_stop_us    = 0;          // captured at recorder_stop (diag uses this, not finalize time)
 static char              s_path[128]  = {0};   // current recording path (for diag sidecar)
 
 // Decoupled SD writer: the capture loop pushes decimated 16k samples into this
@@ -60,6 +62,26 @@ static TaskHandle_t      s_write_task = nullptr;
 static SemaphoreHandle_t s_write_done = nullptr;
 static volatile bool     s_rec_finished = false;     // producer fully done enqueuing
 static volatile uint32_t s_ring_drops = 0;        // bytes dropped on ring-full (should stay 0)
+
+// Background finalizer: recorder_stop() returns immediately and this task drains
+// the SD writer, writes the diagnostic sidecar, patches the WAV header and closes
+// the file — so the UI thread is never blocked on SD I/O at stop.
+static TaskHandle_t      s_finalize_task  = nullptr;
+static SemaphoreHandle_t s_finalize_done  = nullptr;
+static volatile bool     s_finalizing     = false;
+static int64_t           s_finalize_mtime = 0;   // unix secs to stamp on the file (0 = skip)
+static uint8_t           s_diag_regval[16] = {0};// ES8311 regs snapshotted at stop
+
+// ES8311 registers dumped into the diagnostic sidecar. Defined at file scope so
+// recorder_stop() can snapshot the values (while the mic is still enabled) and the
+// background finalizer can format them without re-reading the codec.
+static const struct { uint8_t reg; const char *name; } kDiagRegs[] = {
+    {0x00,"reset/csm"}, {0x01,"clkmgr"}, {0x06,"bclk"},  {0x09,"sdpin"},
+    {0x0A,"sdpout"},    {0x0D,"anapwr"}, {0x0E,"pga/adc"},{0x12,"dacpwr"},
+    {0x14,"mic_sel"},   {0x15,"adc_eq"}, {0x16,"pga_gain"},{0x17,"adc_vol"},
+    {0x31,"dac_mute"},  {0x44,"refsig"},
+};
+#define DIAG_NREG (sizeof(kDiagRegs)/sizeof(kDiagRegs[0]))
 
 // Whole-recording capture stats, filled by rec_task, dumped on stop.
 // Four candidate sources per 32-bit stereo frame: the ADC's 16-bit word can sit
@@ -82,9 +104,7 @@ static inline int16_t extract_cand(uint32_t lw, uint32_t rw, int c)
 }
 
 static TaskHandle_t      s_rec_task = nullptr;
-static TaskHandle_t      s_tx_task  = nullptr;
 static SemaphoreHandle_t s_rec_done = nullptr;
-static SemaphoreHandle_t s_tx_done  = nullptr;
 
 // ── WAV header ───────────────────────────────────────────────────────────────
 static void write_wav_header(FILE *f, uint32_t data_len)
@@ -116,45 +136,16 @@ static void write_wav_header(FILE *f, uint32_t data_len)
 // ── I2S bring-up ─────────────────────────────────────────────────────────────
 static bool i2s_start(void)
 {
-    // I2S0 master TX — generates MCLK/BCLK/WS for the codec. Large DMA so the
-    // shared master clock keeps running even if the silence feeder is briefly
-    // starved (WiFi/SD jitter); a TX underrun gaps BCLK/WS and the slave RX then
-    // loses frames (capture comes out short -> plays back too fast).
-    i2s_chan_config_t tx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    tx_cfg.dma_desc_num  = 8;
-    tx_cfg.dma_frame_num = 512;       // 8 x 512 = ~85 ms of clock slack @48k
-    tx_cfg.auto_clear    = true;      // emit zeros (not stale data) on underrun
-    if (i2s_new_channel(&tx_cfg, &s_tx, nullptr) != ESP_OK) return false;
-
-    i2s_std_config_t tx_std = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(REC_CAPTURE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
-                                                         I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = (gpio_num_t)I2S_MCLK,
-            .bclk = (gpio_num_t)I2S_BCLK,
-            .ws   = (gpio_num_t)I2S_LRC,
-            .dout = (gpio_num_t)I2S_DOUT,
-            .din  = I2S_GPIO_UNUSED,
-            .invert_flags = { false, false, false },
-        },
-    };
-    if (i2s_channel_init_std_mode(s_tx, &tx_std) != ESP_OK) return false;
-    // Preload the TX DMA with silence so the master clock starts with a full
-    // buffer of zeros to clock out (extra underrun margin at startup).
-    {
-        static int32_t z[256] = {0};
-        size_t loaded = 0, total = 0;
-        while (i2s_channel_preload_data(s_tx, z, sizeof(z), &loaded) == ESP_OK && loaded > 0)
-            total += loaded;
-    }
-    if (i2s_channel_enable(s_tx) != ESP_OK) return false;
-
-    // I2S1 slave RX — mic capture, shares I2S0 BCLK/WS. Generous DMA so a brief
-    // reader stall doesn't overflow and drop captured frames.
-    i2s_chan_config_t rx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
+    // I2S0 MASTER, RX-only: the master controller generates MCLK/BCLK/WS itself
+    // and reads the mic on DIN. One master clocking the ES8311 ADC directly means
+    // there is NO second (slave) controller that has to lock onto external clock
+    // pins — and therefore no cross-controller frame sync to lose. The previous
+    // I2S0-master-TX + I2S1-slave-RX scheme dropped mic frames whenever the slave
+    // lost lock, so real audio was stored in too few samples and the clip played
+    // back too fast (the "voice-changer" artifact).
+    i2s_chan_config_t rx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     rx_cfg.dma_desc_num  = 8;
-    rx_cfg.dma_frame_num = 512;       // ~85 ms RX slack @48k
+    rx_cfg.dma_frame_num = 512;       // 8 x 512 = ~85 ms RX slack @48k
     if (i2s_new_channel(&rx_cfg, nullptr, &s_rx) != ESP_OK) return false;
 
     i2s_std_config_t rx_std = {
@@ -162,7 +153,7 @@ static bool i2s_start(void)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
                                                          I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
+            .mclk = (gpio_num_t)I2S_MCLK,
             .bclk = (gpio_num_t)I2S_BCLK,
             .ws   = (gpio_num_t)I2S_LRC,
             .dout = I2S_GPIO_UNUSED,
@@ -170,10 +161,9 @@ static bool i2s_start(void)
             .invert_flags = { false, false, false },
         },
     };
-    // 32-bit slot to match the I2S0 master framing (64 BCLK per WS). The ES8311
-    // 16-bit ADC word lands in the high or low half of a channel slot (board
-    // dependent), recovered by the auto-detected candidate in rec_task. Reading
-    // 16-bit slots here injects a 0x8000 framing artifact, so keep it 32 bits.
+    // 32-bit slot (64 BCLK per WS): the ES8311 16-bit ADC word lands in the high
+    // or low half of a channel slot (board dependent), recovered by the
+    // auto-detected candidate in rec_task.
     rx_std.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
     if (i2s_channel_init_std_mode(s_rx, &rx_std) != ESP_OK) return false;
     if (i2s_channel_enable(s_rx) != ESP_OK) return false;
@@ -184,7 +174,6 @@ static bool i2s_start(void)
 static void i2s_stop(void)
 {
     if (s_rx) { i2s_channel_disable(s_rx); i2s_del_channel(s_rx); s_rx = nullptr; }
-    if (s_tx) { i2s_channel_disable(s_tx); i2s_del_channel(s_tx); s_tx = nullptr; }
 }
 
 // Delay in small slices so a recorder_stop() during startup priming is honored
@@ -195,23 +184,6 @@ static bool running_delay(uint32_t ms)
     for (uint32_t e = 0; e < ms && s_running; e += 20)
         vTaskDelay(pdMS_TO_TICKS(20));
     return s_running;
-}
-
-// ── TX silence task: keep the shared clocks fed ──────────────────────────────
-static void tx_silence_task(void *)
-{
-    const int N = 512;                 // frames per write (match TX dma_frame_num)
-    size_t  bytes = N * 2 * sizeof(int32_t);
-    int32_t *zeros = (int32_t *)heap_caps_calloc(1, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (zeros) {
-        while (s_running) {
-            size_t w = 0;
-            i2s_channel_write(s_tx, zeros, bytes, &w, pdMS_TO_TICKS(100));
-        }
-        heap_caps_free(zeros);
-    }
-    xSemaphoreGive(s_tx_done);
-    vTaskDelete(nullptr);
 }
 
 // ── 48 kHz -> 16 kHz anti-aliased 3:1 decimator ──────────────────────────────
@@ -259,7 +231,7 @@ static void rec_task(void *)
 
     if (stereo && mono) {
         // ── Startup priming: settle analog, flush stale DMA, recover dead ADC ──
-        // The shared I2S0 clocks are already live (tx_silence_task), so the
+        // The I2S0 master RX clock is already live (i2s_channel_enable), so the
         // ES8311 analog path settles during this delay. Then flush any startup
         // garbage from the RX DMA before measuring. If the mic reads as digital
         // silence (intermittent 0x0D=0x02 dead-ADC state), re-assert codec power
@@ -472,14 +444,18 @@ static void write_task(void *)
 // ── Public API ───────────────────────────────────────────────────────────────
 void recorder_init(void)
 {
-    if (!s_rec_done)   s_rec_done   = xSemaphoreCreateBinary();
-    if (!s_tx_done)    s_tx_done    = xSemaphoreCreateBinary();
-    if (!s_write_done) s_write_done = xSemaphoreCreateBinary();
+    if (!s_rec_done)      s_rec_done      = xSemaphoreCreateBinary();
+    if (!s_write_done)    s_write_done    = xSemaphoreCreateBinary();
+    if (!s_finalize_done) s_finalize_done = xSemaphoreCreateBinary();
 }
 
 bool recorder_start(const char *vfs_path)
 {
     if (s_running) return false;
+
+    // A previous recording's SD finalize may still be flushing in the background;
+    // wait for it so the file/ring are fully released before we reopen them.
+    recorder_wait_finalized(8000);
 
     s_file = fopen(vfs_path, "wb");
     if (!s_file) {
@@ -514,6 +490,7 @@ bool recorder_start(const char *vfs_path)
     s_prod_bytes = 0;
     s_ring_drops = 0;
     s_rec_finished = false;
+    s_finalize_mtime = 0;
 
     // Codec: full power-up sequence first. Re-poking power registers does not
     // re-trigger the ES8311 analog state machine, so a codec left in a stuck
@@ -541,24 +518,19 @@ bool recorder_start(const char *vfs_path)
     s_start_us   = esp_timer_get_time();
     s_running    = true;
 
-    xSemaphoreTake(s_tx_done, 0);
     xSemaphoreTake(s_rec_done, 0);
     xSemaphoreTake(s_write_done, 0);
-    // Clock feeder (tx) and reader (rx) are real-time critical for a gap-free
-    // master clock and overflow-free capture: pin BOTH to core 1, away from the
-    // WiFi/LWIP stack and the SD writer (core 0) which would otherwise starve the
-    // feeder, gap the I2S clock, and drop captured frames. Writer tolerates core-0
-    // contention because the 256 KB ring absorbs SD stalls.
+    // The I2S reader is real-time critical for overflow-free capture: pin it to
+    // core 1, away from the WiFi/LWIP stack and the SD writer on core 0. The
+    // writer tolerates core-0 contention because the 256 KB ring absorbs SD stalls.
     BaseType_t ok = pdPASS;
-    ok &= xTaskCreatePinnedToCore(write_task,      "rec_wr", 4096, nullptr, 5, &s_write_task, 0);
-    ok &= xTaskCreatePinnedToCore(tx_silence_task, "rec_tx", 3072, nullptr, 6, &s_tx_task, 1);
-    ok &= xTaskCreatePinnedToCore(rec_task,        "rec_rd", 4096, nullptr, 6, &s_rec_task, 1);
+    ok &= xTaskCreatePinnedToCore(write_task, "rec_wr", 4096, nullptr, 5, &s_write_task, 0);
+    ok &= xTaskCreatePinnedToCore(rec_task,   "rec_rd", 4096, nullptr, 6, &s_rec_task, 1);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "task create failed — aborting recording");
         s_running = false;
         // Let any started tasks observe s_running==false and exit, then reclaim.
         if (s_rec_task)   { xSemaphoreTake(s_rec_done,   pdMS_TO_TICKS(2000)); s_rec_task   = nullptr; }
-        if (s_tx_task)    { xSemaphoreTake(s_tx_done,    pdMS_TO_TICKS(1000)); s_tx_task    = nullptr; }
         s_rec_finished = true;   // unblock writer's exit condition
         if (s_write_task) { xSemaphoreTake(s_write_done, pdMS_TO_TICKS(2000)); s_write_task = nullptr; }
         i2s_stop();
@@ -578,14 +550,6 @@ bool recorder_start(const char *vfs_path)
 static void write_diag_sidecar(void)
 {
     if (s_path[0] == 0) return;
-
-    // Snapshot the key ES8311 registers while the mic is still enabled.
-    struct { uint8_t reg; const char *name; } regs[] = {
-        {0x00,"reset/csm"}, {0x01,"clkmgr"}, {0x06,"bclk"},  {0x09,"sdpin"},
-        {0x0A,"sdpout"},    {0x0D,"anapwr"}, {0x0E,"pga/adc"},{0x12,"dacpwr"},
-        {0x14,"mic_sel"},   {0x15,"adc_eq"}, {0x16,"pga_gain"},{0x17,"adc_vol"},
-        {0x31,"dac_mute"},  {0x44,"refsig"},
-    };
 
     char path[160];
     snprintf(path, sizeof(path), "%s.diag.txt", s_path);
@@ -611,9 +575,9 @@ static void write_diag_sidecar(void)
     // shorter than wall-clock, samples were dropped during capture and the clip
     // plays back too fast (the "voice-changer" artifact).
     {
-        double wall_s  = (double)(esp_timer_get_time() - s_start_us) / 1e6;
+        double wall_s  = (double)(s_stop_us - s_start_us) / 1e6;
         double cap_s   = s_capture_start_us
-                         ? (double)(esp_timer_get_time() - s_capture_start_us) / 1e6 : 0;
+                         ? (double)(s_stop_us - s_capture_start_us) / 1e6 : 0;
         double audio_s = (double)s_data_bytes /
                          ((double)REC_SAMPLE_RATE * REC_CHANNELS * (REC_BITS / 8));
         // Frames the I2S actually delivered during steady capture vs the nominal
@@ -645,9 +609,9 @@ static void write_diag_sidecar(void)
                   ? "chosen candidate AC RMS very low -> mic gain or analog path weak"
                   : "chosen candidate carries clean AC audio -> capture path working"));
     fprintf(d, "\nES8311 registers:\n");
-    for (size_t i = 0; i < sizeof(regs)/sizeof(regs[0]); i++)
+    for (size_t i = 0; i < DIAG_NREG; i++)
         fprintf(d, "  0x%02X %-9s = 0x%02X\n",
-                regs[i].reg, regs[i].name, codec_get_reg(regs[i].reg));
+                kDiagRegs[i].reg, kDiagRegs[i].name, s_diag_regval[i]);
     fprintf(d, "\nexpected: 0x14=0x5A(mic on) 0x17=0xC8(adc vol) 0x0E=0x02 0x0D=0x01\n");
     fprintf(d, "\nfirst raw I2S frames (L32 R32 hex -> Lhi Llo Rhi Rlo int16):\n");
     for (int i = 0; i + 2 <= s_raw_n; i += 2) {
@@ -660,17 +624,13 @@ static void write_diag_sidecar(void)
     ESP_LOGI(TAG, "diag written: %s (cand_used=%d AC RMS=%d)", path, u, rms[u]);
 }
 
-void recorder_stop(void)
+// ── SD finalize (runs off the UI thread) ─────────────────────────────────────
+// Drains the SD writer, writes the diagnostic sidecar, patches the WAV header and
+// closes the file. Called on the background finalize task so recorder_stop() (and
+// thus the UI) never blocks on SD I/O. The reader and I2S are already stopped by
+// recorder_stop() before this runs; only the SD writer is still draining the ring.
+static void finalize_body(void)
 {
-    if (!s_running && !s_file) return;
-    s_running = false;
-
-    // Wait for both tasks to exit before touching shared resources. The read
-    // task may be mid startup-priming (settle/probe/resync); its delays are
-    // sliced so it observes s_running==false within ~200 ms, but allow margin.
-    if (s_rec_task) { xSemaphoreTake(s_rec_done, pdMS_TO_TICKS(2000)); s_rec_task = nullptr; }
-    if (s_tx_task)  { xSemaphoreTake(s_tx_done,  pdMS_TO_TICKS(1000)); s_tx_task  = nullptr; }
-
     // Reader has stopped producing (s_rec_finished is set); wait for the writer to
     // flush every remaining ring item to SD before freeing the ring / closing the
     // file. 256 KB drains in well under a second even with SD stalls, so 8 s is
@@ -687,9 +647,7 @@ void recorder_stop(void)
     if (s_ring_drops) ESP_LOGW(TAG, "ring dropped %u bytes (writer fell behind)",
                                (unsigned)s_ring_drops);
 
-    i2s_stop();
-    write_diag_sidecar();          // snapshot regs while mic still enabled
-    codec_enable_mic(false);
+    write_diag_sidecar();          // uses the register snapshot taken at stop
 
     if (writer_joined && s_file) {
         fflush(s_file);
@@ -699,10 +657,69 @@ void recorder_stop(void)
         fflush(s_file);
         fclose(s_file);
         s_file = nullptr;
+        // Stamp the real mtime (FAT is otherwise 1980 until SNTP runs) now that the
+        // file is closed, so a later fclose can't overwrite it.
+        if (s_finalize_mtime && s_path[0]) {
+            struct utimbuf ut;
+            ut.actime = ut.modtime = (time_t)s_finalize_mtime;
+            utime(s_path, &ut);
+        }
     }
-    ESP_LOGI(TAG, "stopped, %u PCM bytes (produced %u, dropped %u)",
+    ESP_LOGI(TAG, "finalized, %u PCM bytes (produced %u, dropped %u)",
              (unsigned)s_data_bytes, (unsigned)s_prod_bytes, (unsigned)s_ring_drops);
 }
+
+static void finalize_task(void *)
+{
+    finalize_body();
+    s_finalize_task = nullptr;
+    s_finalizing    = false;
+    xSemaphoreGive(s_finalize_done);
+    vTaskDelete(nullptr);
+}
+
+void recorder_stop(void)
+{
+    if (!s_running && !s_file) return;
+    s_running = false;
+
+    // Stop the reader and release the I2S0 master so playback / the stop tone can
+    // reuse it immediately. The read task may be mid startup-priming (settle/probe
+    // /resync); its delays are sliced so it observes s_running==false within ~200 ms.
+    if (s_rec_task) { xSemaphoreTake(s_rec_done, pdMS_TO_TICKS(2000)); s_rec_task = nullptr; }
+    i2s_stop();
+
+    // Snapshot the ES8311 registers now, while the mic is still enabled and before
+    // anything else (stop tone / playback) reconfigures the codec, so the diag is
+    // accurate even though it is written later on the background finalizer.
+    for (size_t i = 0; i < DIAG_NREG; i++)
+        s_diag_regval[i] = codec_get_reg(kDiagRegs[i].reg);
+    codec_enable_mic(false);
+    s_stop_us = esp_timer_get_time();
+
+    // Hand the slow SD work (drain ring, write diag, patch WAV header, close) to a
+    // detached background task so the UI thread is not blocked. recorder_start()
+    // and deep sleep wait on s_finalizing via recorder_wait_finalized().
+    xSemaphoreTake(s_finalize_done, 0);   // clear any stale completion signal
+    s_finalizing = true;
+    if (xTaskCreatePinnedToCore(finalize_task, "rec_fin", 4096, nullptr, 4,
+                                &s_finalize_task, 0) != pdPASS) {
+        ESP_LOGE(TAG, "finalize task create failed — finalizing inline");
+        finalize_body();
+        s_finalizing = false;
+        xSemaphoreGive(s_finalize_done);
+    }
+    ESP_LOGI(TAG, "stopped (SD finalize running in background)");
+}
+
+void recorder_wait_finalized(uint32_t timeout_ms)
+{
+    if (!s_finalizing) return;
+    if (xSemaphoreTake(s_finalize_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE)
+        xSemaphoreGive(s_finalize_done);   // leave it signalled (idempotent)
+}
+
+void recorder_set_save_time(int64_t unix_secs) { s_finalize_mtime = unix_secs; }
 
 bool recorder_is_active(void) { return s_running; }
 
