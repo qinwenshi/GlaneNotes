@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/ringbuf.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -44,9 +45,20 @@ static i2s_chan_handle_t s_rx = nullptr;  // I2S1 slave  (mic capture)
 
 static volatile bool     s_running = false;
 static FILE             *s_file    = nullptr;
-static volatile uint32_t s_data_bytes = 0;
+static volatile uint32_t s_data_bytes = 0;        // PCM bytes actually written to SD
+static volatile uint32_t s_prod_bytes = 0;        // PCM bytes produced by capture loop
 static int64_t           s_start_us   = 0;
 static char              s_path[128]  = {0};   // current recording path (for diag sidecar)
+
+// Decoupled SD writer: the capture loop pushes decimated 16k samples into this
+// PSRAM ring buffer and a separate task drains it to the SD card, so a blocking
+// SD write never stalls the I2S reader (which would overflow the RX DMA and drop
+// samples — the cause of the "too fast / voice-changer" playback).
+static RingbufHandle_t   s_ring       = nullptr;
+static TaskHandle_t      s_write_task = nullptr;
+static SemaphoreHandle_t s_write_done = nullptr;
+static volatile bool     s_rec_finished = false;     // producer fully done enqueuing
+static volatile uint32_t s_ring_drops = 0;        // bytes dropped on ring-full (should stay 0)
 
 // Whole-recording capture stats, filled by rec_task, dumped on stop.
 // Four candidate sources per 32-bit stereo frame: the ADC's 16-bit word can sit
@@ -374,8 +386,19 @@ static void rec_task(void *)
             }
 
             size_t wlen = (size_t)outn * sizeof(int16_t);
-            if (s_file && outn) fwrite(mono, 1, wlen, s_file);
-            s_data_bytes += wlen;
+            if (s_ring && outn) {
+                // Push to the SD-writer ring instead of writing here. A short
+                // timeout only bites if the writer can't keep up (won't, at
+                // ~32 KB/s vs MB/s SD); dropping rather than blocking keeps the
+                // reader tight so the I2S RX DMA never overflows — preserving the
+                // true sample rate (a stalled reader drops samples and the clip
+                // plays back too fast, the "voice-changer" artifact).
+                if (xRingbufferSend(s_ring, mono, wlen, pdMS_TO_TICKS(8)) != pdTRUE) {
+                    s_ring_drops += (uint32_t)wlen;
+                } else {
+                    s_prod_bytes += (uint32_t)wlen;
+                }
+            }
 
             // Periodic capture-level log (AC RMS of the chosen candidate).
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -387,7 +410,7 @@ static void rec_task(void *)
                 last_log_ms = now_ms;
             }
 
-            if (s_data_bytes >= max_bytes) {
+            if (s_prod_bytes >= max_bytes) {
                 ESP_LOGW(TAG, "max recording length reached");
                 s_running = false;
                 break;
@@ -398,15 +421,45 @@ static void rec_task(void *)
     }
     heap_caps_free(stereo);
     heap_caps_free(mono);
+    s_rec_finished = true;          // signal writer: no more items will be enqueued
     xSemaphoreGive(s_rec_done);
+    vTaskDelete(nullptr);
+}
+
+// ── SD writer task ───────────────────────────────────────────────────────────
+// Drains the capture ring buffer to the SD card. Runs decoupled from rec_task so
+// a blocking SD write never stalls the I2S reader. Exits only once the producer
+// has finished (s_rec_finished) AND the ring is fully drained, so no captured
+// audio is lost on stop.
+static void write_task(void *)
+{
+    for (;;) {
+        size_t len = 0;
+        void *item = xRingbufferReceive(s_ring, &len, pdMS_TO_TICKS(100));
+        if (item) {
+            if (s_file && len) {
+                size_t n = fwrite(item, 1, len, s_file);
+                s_data_bytes += (uint32_t)n;
+                if (n != len) ESP_LOGW(TAG, "SD short write %u/%u", (unsigned)n, (unsigned)len);
+            }
+            vRingbufferReturnItem(s_ring, item);
+            continue;   // drain greedily while data is available
+        }
+        // NULL receive (ring empty for 100 ms). Exit only after the producer has
+        // signalled it is fully done — using s_running alone would race the
+        // reader's final in-flight chunk and drop tail audio.
+        if (s_rec_finished) break;
+    }
+    xSemaphoreGive(s_write_done);
     vTaskDelete(nullptr);
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
 void recorder_init(void)
 {
-    if (!s_rec_done) s_rec_done = xSemaphoreCreateBinary();
-    if (!s_tx_done)  s_tx_done  = xSemaphoreCreateBinary();
+    if (!s_rec_done)   s_rec_done   = xSemaphoreCreateBinary();
+    if (!s_tx_done)    s_tx_done    = xSemaphoreCreateBinary();
+    if (!s_write_done) s_write_done = xSemaphoreCreateBinary();
 }
 
 bool recorder_start(const char *vfs_path)
@@ -433,6 +486,20 @@ bool recorder_start(const char *vfs_path)
     s_cand_used    = 1;
     s_raw_n        = 0;
 
+    // Create the PSRAM ring buffer + spin up the SD writer task (decoupled from
+    // capture). NO-SPLIT so each push is returned as one contiguous block.
+    s_ring = xRingbufferCreateWithCaps(REC_RING_BYTES, RINGBUF_TYPE_BYTEBUF,
+                                       MALLOC_CAP_SPIRAM);
+    if (!s_ring) {
+        ESP_LOGE(TAG, "ring buffer alloc failed");
+        fclose(s_file);
+        s_file = nullptr;
+        return false;
+    }
+    s_prod_bytes = 0;
+    s_ring_drops = 0;
+    s_rec_finished = false;
+
     // Codec: full power-up sequence first. Re-poking power registers does not
     // re-trigger the ES8311 analog state machine, so a codec left in a stuck
     // silent-ADC state (identical register values yet no analog signal, seen
@@ -448,6 +515,8 @@ bool recorder_start(const char *vfs_path)
     if (!i2s_start()) {
         ESP_LOGE(TAG, "i2s_start failed");
         i2s_stop();
+        vRingbufferDeleteWithCaps(s_ring);
+        s_ring = nullptr;
         fclose(s_file);
         s_file = nullptr;
         return false;
@@ -459,8 +528,27 @@ bool recorder_start(const char *vfs_path)
 
     xSemaphoreTake(s_tx_done, 0);
     xSemaphoreTake(s_rec_done, 0);
-    xTaskCreatePinnedToCore(tx_silence_task, "rec_tx", 3072, nullptr, 4, &s_tx_task, 0);
-    xTaskCreatePinnedToCore(rec_task,        "rec_rd", 4096, nullptr, 6, &s_rec_task, 1);
+    xSemaphoreTake(s_write_done, 0);
+    // Writer on core 0 (with TX silence); tight reader alone on core 1.
+    BaseType_t ok = pdPASS;
+    ok &= xTaskCreatePinnedToCore(write_task,      "rec_wr", 4096, nullptr, 5, &s_write_task, 0);
+    ok &= xTaskCreatePinnedToCore(tx_silence_task, "rec_tx", 3072, nullptr, 4, &s_tx_task, 0);
+    ok &= xTaskCreatePinnedToCore(rec_task,        "rec_rd", 4096, nullptr, 6, &s_rec_task, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "task create failed — aborting recording");
+        s_running = false;
+        // Let any started tasks observe s_running==false and exit, then reclaim.
+        if (s_rec_task)   { xSemaphoreTake(s_rec_done,   pdMS_TO_TICKS(2000)); s_rec_task   = nullptr; }
+        if (s_tx_task)    { xSemaphoreTake(s_tx_done,    pdMS_TO_TICKS(1000)); s_tx_task    = nullptr; }
+        s_rec_finished = true;   // unblock writer's exit condition
+        if (s_write_task) { xSemaphoreTake(s_write_done, pdMS_TO_TICKS(2000)); s_write_task = nullptr; }
+        i2s_stop();
+        vRingbufferDeleteWithCaps(s_ring);
+        s_ring = nullptr;
+        fclose(s_file);
+        s_file = nullptr;
+        return false;
+    }
 
     ESP_LOGI(TAG, "recording -> %s", vfs_path);
     return true;
@@ -500,6 +588,18 @@ static void write_diag_sidecar(void)
     fprintf(d, "pcm_bytes      : %u\n", (unsigned)s_data_bytes);
     fprintf(d, "sample_rate    : %d Hz, %d-bit, %d ch\n",
             REC_SAMPLE_RATE, REC_BITS, REC_CHANNELS);
+    // Wall-clock vs audio duration: must match (ratio ~1.00). If audio is much
+    // shorter than wall-clock, samples were dropped during capture and the clip
+    // plays back too fast (the "voice-changer" artifact).
+    {
+        double wall_s  = (double)(esp_timer_get_time() - s_start_us) / 1e6;
+        double audio_s = (double)s_data_bytes /
+                         ((double)REC_SAMPLE_RATE * REC_CHANNELS * (REC_BITS / 8));
+        fprintf(d, "timing         : wall=%.2fs audio=%.2fs ratio=%.2f (1.00=no drops)\n",
+                wall_s, audio_s, audio_s > 0 ? wall_s / audio_s : 0.0);
+        fprintf(d, "ring_drops     : %u bytes produced=%u written=%u\n",
+                (unsigned)s_ring_drops, (unsigned)s_prod_bytes, (unsigned)s_data_bytes);
+    }
     fprintf(d, "sw_gain        : %dx\n", REC_SW_GAIN);
     fprintf(d, "capture        : %d Hz, 32-bit slot, anti-aliased resample ->%d Hz, DC-blocked\n",
             REC_CAPTURE_RATE, REC_SAMPLE_RATE);
@@ -543,11 +643,27 @@ void recorder_stop(void)
     if (s_rec_task) { xSemaphoreTake(s_rec_done, pdMS_TO_TICKS(2000)); s_rec_task = nullptr; }
     if (s_tx_task)  { xSemaphoreTake(s_tx_done,  pdMS_TO_TICKS(1000)); s_tx_task  = nullptr; }
 
+    // Reader has stopped producing (s_rec_finished is set); wait for the writer to
+    // flush every remaining ring item to SD before freeing the ring / closing the
+    // file. 256 KB drains in well under a second even with SD stalls, so 8 s is
+    // ample. If the writer does NOT join (catastrophic SD hang mid-fwrite), it may
+    // still be touching s_ring/s_file — do not free them in that case.
+    bool writer_joined = true;
+    if (s_write_task) {
+        writer_joined = (xSemaphoreTake(s_write_done, pdMS_TO_TICKS(8000)) == pdTRUE);
+        if (writer_joined) s_write_task = nullptr;
+        else ESP_LOGE(TAG, "SD writer did not exit — leaving ring/file to avoid UAF");
+    }
+    if (writer_joined && s_ring) { vRingbufferDeleteWithCaps(s_ring); s_ring = nullptr; }
+
+    if (s_ring_drops) ESP_LOGW(TAG, "ring dropped %u bytes (writer fell behind)",
+                               (unsigned)s_ring_drops);
+
     i2s_stop();
     write_diag_sidecar();          // snapshot regs while mic still enabled
     codec_enable_mic(false);
 
-    if (s_file) {
+    if (writer_joined && s_file) {
         fflush(s_file);
         // Patch RIFF + data sizes now that the length is known.
         fseek(s_file, 0, SEEK_SET);
@@ -556,7 +672,8 @@ void recorder_stop(void)
         fclose(s_file);
         s_file = nullptr;
     }
-    ESP_LOGI(TAG, "stopped, %u PCM bytes", (unsigned)s_data_bytes);
+    ESP_LOGI(TAG, "stopped, %u PCM bytes (produced %u, dropped %u)",
+             (unsigned)s_data_bytes, (unsigned)s_prod_bytes, (unsigned)s_ring_drops);
 }
 
 bool recorder_is_active(void) { return s_running; }

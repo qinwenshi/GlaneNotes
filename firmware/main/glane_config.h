@@ -57,6 +57,13 @@
 #define REC_BITS          16
 #define REC_CHANNELS      1
 #define REC_MAX_SECONDS   600     // hard cap (~19 MB) to avoid runaway files
+// PSRAM ring buffer between the capture loop and the SD writer task. SD writes
+// block tens of ms; doing them inside the I2S read loop stalls the reader and
+// overflows the RX DMA ring, dropping samples (recording plays back too fast —
+// a "voice-changer" pitch/formant shift). Decoupling via this ring keeps the
+// reader tight so DMA never overflows. 256 KB ≈ 8 s of 16 k/16-bit cushion,
+// far more than any single SD write stall (output is only ~32 KB/s).
+#define REC_RING_BYTES    (256 * 1024)
 #define REC_SW_GAIN       2       // software gain (analog PGA does the heavy lift)
 #define REC_MIC_PGA_GAIN  4       // ES8311 analog PGA gain 0-7 (lower = headroom,
                                   // avoids ADC-stage clipping that sounds harsh)
