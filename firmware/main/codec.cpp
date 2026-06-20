@@ -353,3 +353,8 @@ void codec_read_all(void)
         ESP_LOGI(TAG, "0x%02X: 0x%02X", i, codec_read_reg(i));
     }
 }
+
+uint8_t codec_get_reg(uint8_t reg)
+{
+    return codec_read_reg(reg);
+}

@@ -48,10 +48,16 @@
 #define PWR_BTN     18
 
 // ── Recording format ─────────────────────────────────────────────────────────
-#define REC_SAMPLE_RATE   16000   // 16 kHz, matches DashScope ASR
+#define REC_SAMPLE_RATE   16000   // 16 kHz output WAV, matches DashScope ASR
+#define REC_CAPTURE_RATE  48000   // ES8311/I2S run at 48 kHz (proven mic rate),
+                                  // then decimated /3 to REC_SAMPLE_RATE. The
+                                  // ADC word only aligns cleanly in an I2S lane
+                                  // at this rate; 16 kHz capture yields fragments.
+#define REC_DECIM         (REC_CAPTURE_RATE / REC_SAMPLE_RATE)  // = 3
 #define REC_BITS          16
 #define REC_CHANNELS      1
 #define REC_MAX_SECONDS   600     // hard cap (~19 MB) to avoid runaway files
+#define REC_SW_GAIN       4       // software gain for the quiet onboard mic
 
 // ── Filesystem layout ────────────────────────────────────────────────────────
 #define SD_MOUNT          "/sdcard"

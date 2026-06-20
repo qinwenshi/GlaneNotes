@@ -15,6 +15,7 @@ void    codec_enable_mic(bool en);
 void    codec_set_mic_gain(uint8_t gain); // 0-7
 void    codec_dac_mute(bool mute);
 void    codec_read_all(void);             // debug register dump
+uint8_t codec_get_reg(uint8_t reg);       // read a single register (debug)
 
 #ifdef __cplusplus
 }
