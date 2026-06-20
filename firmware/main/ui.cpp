@@ -152,8 +152,8 @@ static void draw_i1_sprite(const uint8_t *data, int w, int h, int stride,
 }
 
 // ── Home-screen dog layout (right half of the 200x200 panel) ─────────────────
-static const int DOG_OX = 100;
-static const int DOG_OY = 46;
+static const int DOG_OX = 104;
+static const int DOG_OY = 44;
 
 // Repaint just the dog region white, then stamp one running frame into it.
 static void draw_idle_dog(int frame)
@@ -226,28 +226,28 @@ void ui_show_idle(int note_count, int wifi_connected, const char *ip, int batter
     if (!s_epd) return;
     s_epd->EPD_Clear();
 
-    // Battery indicator, top-left, with percentage text to its right.
-    battery_icon(8, 6, battery_pct);
+    // Battery indicator, top-RIGHT, with the percentage text to its left.
+    battery_icon(155, 6, battery_pct);
     if (battery_pct >= 0) {
         char b[16];
         snprintf(b, sizeof(b), "%d%%", battery_pct);
-        draw_text(50, 8, b, 1);
+        draw_text_right(150, 8, b, 1);
     }
 
-    draw_text_centered(28, "GLANE NOTES", 2);
+    draw_text_centered(24, "GLANE NOTES", 2);
 
-    // Left column: status text. Right half: the awake (running) dog.
+    // Left column: larger status text. Right half: the dog.
     char buf[48];
     snprintf(buf, sizeof(buf), "Notes:%d", note_count);
-    draw_text(8, 60, buf, 1);
-    draw_text(8, 80, wifi_connected ? "WiFi:ON" : "WiFi:--", 1);
-    if (wifi_connected && ip && ip[0]) draw_text(8, 100, ip, 1);
+    draw_text(6, 52, buf, 2);
+    draw_text(6, 80, wifi_connected ? "WiFi:ON" : "WiFi:--", 2);
 
     draw_idle_dog(0);
 
-    hline(160, 16, EPD_W - 16);
-    draw_text_centered(168, "PRESS TO RECORD", 1);
-    draw_text_centered(182, "HOLD TO SYNC", 1);
+    // IP shown larger, centered just below the dog.
+    if (wifi_connected && ip && ip[0]) draw_text_centered(150, ip, 2);
+
+    draw_text_centered(180, "PRESS:REC  HOLD:SYNC", 1);
     commit(SCR_IDLE);
 }
 
