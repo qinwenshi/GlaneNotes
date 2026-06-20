@@ -98,7 +98,8 @@ Full pin map: [`firmware/main/glane_config.h`](firmware/main/glane_config.h).
 
 ## 🚀 Build, flash & monitor
 
-Requires **ESP-IDF v5.5+** and an ESP32-S3 target. The convenience scripts in
+Requires **ESP-IDF v5.5+** and an ESP32-S3 target (developed and verified on
+**ESP-IDF v5.5.2**). The convenience scripts in
 [`firmware/scripts/`](firmware/scripts/) auto-source ESP-IDF and auto-detect the
 serial port.
 

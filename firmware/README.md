@@ -57,7 +57,7 @@ play while idle, never during capture.
 
 ## Build & flash
 
-Requires ESP-IDF **v5.5+**.
+Requires ESP-IDF **v5.5+** (developed and verified on **v5.5.2**).
 
 ### Helper scripts (recommended)
 

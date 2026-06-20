@@ -84,8 +84,8 @@ ES8311 音频编解码. -->
 
 ## 🚀 构建、烧录与监视
 
-需要 **ESP-IDF v5.5+** 与 ESP32-S3 目标芯片。[`firmware/scripts/`](firmware/scripts/)
-下的脚本会自动加载 ESP-IDF 环境并自动探测串口。
+需要 **ESP-IDF v5.5+** 与 ESP32-S3 目标芯片（开发与验证基于 **ESP-IDF v5.5.2**）。
+[`firmware/scripts/`](firmware/scripts/) 下的脚本会自动加载 ESP-IDF 环境并自动探测串口。
 
 ```bash
 cd firmware
