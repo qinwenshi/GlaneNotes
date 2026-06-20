@@ -192,6 +192,8 @@ static bool apply_sample_rate(uint32_t sample_rate)
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+bool codec_configure_seq(void);
+
 bool codec_init(int sda, int scl, uint32_t freq_hz)
 {
     i2c_master_bus_config_t bus_cfg = {};
@@ -219,6 +221,22 @@ bool codec_init(int sda, int scl, uint32_t freq_hz)
 
     uint8_t reg;
 
+    if (!codec_configure_seq()) return false;
+
+    ESP_LOGI(TAG, "ES8311 init OK");
+    return true;
+}
+
+// Full ES8311 register power-up sequence: software reset, clock/SDP config, and
+// analog ADC/DAC enable. Split out from codec_init so it can be re-run on its
+// own (codec_reset) — re-poking individual power registers does NOT re-trigger
+// the chip state-machine VMID/bias ramp, so a codec stuck in a silent-ADC state
+// (identical register values yet no analog signal) is only cleared by re-running
+// the soft reset (0x00) here.
+bool codec_configure_seq(void)
+{
+    uint8_t reg;
+
     // Software reset
     codec_write_reg(0x00, 0x1F);
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -240,6 +258,7 @@ bool codec_init(int sda, int scl, uint32_t freq_hz)
 
     // CSM_ON: trigger chip startup sequence
     codec_write_reg(0x00, 0x80);
+    vTaskDelay(pdMS_TO_TICKS(5));
 
     // I2S slave mode: clear bit6 of reg00
     reg  = codec_read_reg(0x00);
@@ -259,7 +278,7 @@ bool codec_init(int sda, int scl, uint32_t freq_hz)
     reg &= (uint8_t)~(1u << 5);
     codec_write_reg(0x06, reg);
 
-    // Default sample rate 48 kHz, 16-bit
+    // Default sample rate, 16-bit
     apply_sample_rate(s_sample_rate);
 
     // 16-bit: bits[4:2] = 0b011 in reg09/reg0A
@@ -297,8 +316,15 @@ bool codec_init(int sda, int scl, uint32_t freq_hz)
     uint8_t reg32 = (uint8_t)((uint16_t)s_volume * 255 / 100);
     codec_write_reg(0x32, reg32);
 
-    ESP_LOGI(TAG, "ES8311 init OK");
     return true;
+}
+
+// Re-run the full power-up sequence to recover a codec stuck in a silent-ADC
+// state. Callers must re-apply their mode-specific settings (sample rate, mic
+// enable/gain, mute) afterwards.
+void codec_reset(void)
+{
+    codec_configure_seq();
 }
 
 void codec_set_volume(uint8_t vol)
@@ -324,19 +350,23 @@ void codec_set_sample_rate(uint32_t hz)
 
 void codec_enable_mic(bool en)
 {
-    // reg14: bit6 selects MIC input; keep LINEOUT bits from init (0x1A base)
-    uint8_t reg = 0x1A;
-    if (en) reg |= (1u << 6);
     if (en) {
         // Re-assert the full ADC analog power path so a recording never depends
-        // on leftover register state (after deep-sleep wake or playback the
-        // ES8311 has been observed with 0x0D=0x02, which mutes the ADC and
-        // yields digital silence). These four writes guarantee a live mic.
+        // on leftover register state. This mirrors the canonical es8311_start()
+        // ADC-enable sequence (esp-adf) and the proven EPaper reference.
         codec_write_reg(0x0D, 0x01); // power up analog circuitry
         codec_write_reg(0x0E, 0x02); // enable analog PGA + ADC modulator
+        codec_write_reg(0x17, 0xC8); // ADC volume
+        // REG14 = 0x1A: analog MIC input, DMIC OFF. Bit6 (0x40) is the DMIC
+        // (digital-mic) select — this board has an ANALOG mic, so setting it
+        // routes the ADC to the unconnected DMIC pin and yields intermittent
+        // digital silence. Keep bit6 clear (0x1A), matching es8311_start with
+        // IS_DMIC=0 and the reference's "0x14=0x1A // MIC input, no DMIC".
+        codec_write_reg(0x14, 0x1A);
+    } else {
+        codec_write_reg(0x17, 0x00); // ADC volume off
+        codec_write_reg(0x14, 0x00); // mic input off
     }
-    codec_write_reg(0x17, 0xC8); // ADC volume
-    codec_write_reg(0x14, reg);  // mic select + analog output enable
 }
 
 void codec_set_mic_gain(uint8_t gain)

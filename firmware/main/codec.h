@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 bool    codec_init(int sda, int scl, uint32_t freq_hz);
+void    codec_reset(void);                // re-run full power-up (recover stuck ADC)
 void    codec_set_volume(uint8_t vol);   // 0-100
 uint8_t codec_get_volume(void);
 void    codec_set_sample_rate(uint32_t hz);

@@ -265,9 +265,13 @@ static void rec_task(void *)
                          attempt);
                 break;
             }
-            ESP_LOGW(TAG, "mic digital-silent (max AC RMS=%d) -> codec power + I2S resync (attempt %d)",
+            ESP_LOGW(TAG, "mic digital-silent (max AC RMS=%d) -> codec reset + I2S resync (attempt %d)",
                      maxrms, attempt + 1);
-            codec_enable_mic(true);                     // re-assert 0x0D/0x0E/0x17/0x14
+            codec_reset();                              // full CSM reset re-runs analog ramp
+            codec_set_sample_rate(REC_CAPTURE_RATE);
+            codec_enable_mic(true);
+            codec_set_mic_gain(6);
+            codec_dac_mute(true);
             i2s_channel_disable(s_rx);
             running_delay(30);
             i2s_channel_enable(s_rx);
@@ -411,7 +415,12 @@ bool recorder_start(const char *vfs_path)
     s_cand_used    = 1;
     s_raw_n        = 0;
 
-    // Codec: 48 kHz capture (proven mic rate), mic on with healthy gain.
+    // Codec: full power-up sequence first. Re-poking power registers does not
+    // re-trigger the ES8311 analog state machine, so a codec left in a stuck
+    // silent-ADC state (identical register values yet no analog signal, seen
+    // after deep-sleep wake or playback) is only cleared by re-running the soft
+    // reset. Then configure for 48 kHz capture (proven mic rate) with mic on.
+    codec_reset();
     codec_set_sample_rate(REC_CAPTURE_RATE);
     codec_enable_mic(true);
     codec_set_mic_gain(6);
