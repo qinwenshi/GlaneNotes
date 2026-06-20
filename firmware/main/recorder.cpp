@@ -188,69 +188,32 @@ static void tx_silence_task(void *)
     vTaskDelete(nullptr);
 }
 
-// ── Streaming resampler (ported from the proven EPaper voice_sr reference) ────
-// 48 kHz -> 16 kHz with pair-averaging (anti-alias) followed by linear
-// interpolation. Far cleaner than a boxcar /3 decimator, whose weak stopband
-// folds 8–24 kHz mic/ADC hiss back into the audband as audible noise. `pos`
-// holds the sub-sample phase across calls; the caller carries any unconsumed
-// tail samples so chunk boundaries don't click. Returns output samples written
-// and reports how many input samples were fully consumed via *consumed.
-typedef struct { uint32_t in_rate; uint64_t pos; } rs_state_t;
+// ── 48 kHz -> 16 kHz anti-aliased 3:1 decimator ──────────────────────────────
+// A symmetric 23-tap low-pass FIR (Hamming window, ~7 kHz cutoff, unity DC gain,
+// Q15) applied to the 48 kHz candidate stream; one output is emitted every third
+// input sample. Unlike the boxcar /3 average (weak stopband -> hiss aliases into
+// band) or a fractional resampler (which, at the exact 3:1 ratio, alternates
+// single-/double-tap filtering and imposes an 8 kHz modulation that sounds like a
+// voice-changer), this treats every output identically: correct pitch, clean
+// stopband, no modulation. Filter state (hist/phase) persists across reads.
+#define DECIM_NTAPS 23
+static const int16_t DECIM_COEF[DECIM_NTAPS] = {
+    -46, 27, 164, 270, 68, -583, -1252, -953, 1119, 4670, 8122, 9556,
+    8122, 4670, 1119, -953, -1252, -583, 68, 270, 164, 27, -46
+};
 
-static int resample_to_16k(rs_state_t *rs, const int16_t *in, int in_cnt,
-                           uint32_t in_rate, int16_t *out, int out_max, int *consumed)
-{
-    if (rs->in_rate != in_rate) { rs->in_rate = in_rate; rs->pos = 0; }
-
-    int n = 0;
-    uint32_t half_rate = in_rate / 2;
-
-    if (half_rate >= REC_SAMPLE_RATE) {
-        // in_rate >= 32 kHz: average adjacent pairs, then interpolate.
-        while (n < out_max) {
-            uint32_t i0 = (uint32_t)(rs->pos / REC_SAMPLE_RATE);
-            if ((int)(i0 * 2 + 3) >= in_cnt) break;
-            int s0 = ((int)in[i0 * 2 + 0] + in[i0 * 2 + 1]) >> 1;
-            int s1 = ((int)in[i0 * 2 + 2] + in[i0 * 2 + 3]) >> 1;
-            int f  = (int)((rs->pos % REC_SAMPLE_RATE) * 256 / REC_SAMPLE_RATE);
-            out[n++] = (int16_t)(((256 - f) * s0 + f * s1) >> 8);
-            rs->pos += half_rate;
-        }
-        uint32_t i0 = (uint32_t)(rs->pos / REC_SAMPLE_RATE);
-        *consumed = (int)(i0 * 2);
-        rs->pos -= (uint64_t)i0 * REC_SAMPLE_RATE;
-    } else {
-        // in_rate < 32 kHz: direct linear interpolation (no pair-average).
-        while (n < out_max) {
-            uint32_t i0 = (uint32_t)(rs->pos / REC_SAMPLE_RATE);
-            if ((int)(i0 + 1) >= in_cnt) break;
-            int f = (int)((rs->pos % REC_SAMPLE_RATE) * 256 / REC_SAMPLE_RATE);
-            out[n++] = (int16_t)(((256 - f) * (int)in[i0] + f * (int)in[i0 + 1]) >> 8);
-            rs->pos += in_rate;
-        }
-        uint32_t i0 = (uint32_t)(rs->pos / REC_SAMPLE_RATE);
-        *consumed = (int)i0;
-        rs->pos -= (uint64_t)i0 * REC_SAMPLE_RATE;
-    }
-    return n;
-}
-
-// ── Recorder task: mic @48k → candidate extract → resample 16k → mono WAV ─────
+// ── Recorder task: mic @48k → candidate extract → FIR decimate 16k → WAV ──────
 // Each captured frame is a 32-bit stereo pair. The ES8311's 16-bit ADC word may
 // land in the high OR low half of either channel slot (board-dependent), so we
 // auto-detect among four candidates (L-hi, L-lo, R-hi, R-lo) by AC (mean-removed)
 // energy with 0x8000 rail-ghost rejection, lock the choice after ~150 ms, then
-// resample 48k→16k (anti-aliased), DC-block, apply gain and clamp into the WAV.
+// 3:1 FIR-decimate 48k→16k (anti-aliased), DC-block, apply gain, clamp into WAV.
 static void rec_task(void *)
 {
     const int FRAMES = 768;                       // 48k stereo frames per read (16 ms)
     size_t  in_bytes = (size_t)FRAMES * 2 * sizeof(uint32_t);
     uint32_t *stereo = (uint32_t *)heap_caps_malloc(in_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    // Extracted candidate @48k (+ a few carried-over tail samples), the resampled
-    // 16k stream, and the final WAV buffer.
-    int16_t  *mic48  = (int16_t *)heap_caps_malloc((FRAMES + 8) * sizeof(int16_t),
-                                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    int16_t  *mono   = (int16_t *)heap_caps_malloc((FRAMES / 2 + 8) * sizeof(int16_t),
+    int16_t  *mono   = (int16_t *)heap_caps_malloc((FRAMES / 3 + 8) * sizeof(int16_t),
                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     uint32_t max_bytes = (uint32_t)REC_SAMPLE_RATE * REC_CHANNELS * (REC_BITS / 8) * REC_MAX_SECONDS;
 
@@ -261,15 +224,14 @@ static void rec_task(void *)
     uint32_t last_log_ms = 0;
     uint32_t warmup      = 0;        // frames seen (skip first ~150 ms for sel lock)
     bool     sel_locked  = false;
-    rs_state_t rs        = {0, 0};   // 48k->16k resampler phase
-    int16_t  carry[8];               // unconsumed 48k tail carried between reads
-    int      carry_n     = 0;
+    int16_t  hist[DECIM_NTAPS] = {0}; // FIR delay line (hist[0] = newest), 48k
+    int      phase       = 0;         // 3:1 decimation phase (emit every 3rd input)
     // One-pole DC blocker (y = x - x_prev + a*y_prev) over the 16k stream.
     int32_t  hp_xprev    = 0;
     int32_t  hp_yprev    = 0;
     bool     hp_init     = false;
 
-    if (stereo && mic48 && mono) {
+    if (stereo && mono) {
         // ── Startup priming: settle analog, flush stale DMA, recover dead ADC ──
         // The shared I2S0 clocks are already live (tx_silence_task), so the
         // ES8311 analog path settles during this delay. Then flush any startup
@@ -383,38 +345,31 @@ static void rec_task(void *)
             }
             s_cand_used = sel;
 
-            // Extract the chosen candidate at 48 kHz (prepending any tail samples
-            // carried from the previous read), resample to 16 kHz with the
-            // anti-aliased resampler, DC-block, then apply gain. Output is gated
-            // until the candidate locks, dropping the loud ADC start-up transient.
-            int total = carry_n;
-            for (int i = 0; i < carry_n; i++) mic48[i] = carry[i];
-            for (int i = 0; i < n; i++)
-                mic48[total++] = extract_cand(stereo[i * 2], stereo[i * 2 + 1], sel);
-
-            int consumed = 0;
-            int rn = resample_to_16k(&rs, mic48, total, REC_CAPTURE_RATE,
-                                     mono, FRAMES / 2 + 8, &consumed);
-            // Carry the unconsumed 48k tail to the next read (avoids boundary clicks).
-            carry_n = total - consumed;
-            if (carry_n < 0) carry_n = 0;
-            if (carry_n > (int)(sizeof(carry) / sizeof(carry[0])))
-                carry_n = (int)(sizeof(carry) / sizeof(carry[0]));
-            for (int i = 0; i < carry_n; i++) mic48[i] = mic48[consumed + i];
-            for (int i = 0; i < carry_n; i++) carry[i] = mic48[i];
-
+            // Extract the chosen candidate at 48 kHz, push through the FIR delay
+            // line, and emit one anti-aliased 16 kHz output every third sample;
+            // then DC-block and apply gain. Output is gated until the candidate
+            // locks, dropping the loud ADC start-up transient.
             int outn = 0;
-            for (int i = 0; i < rn; i++) {
-                int32_t x = mono[i];
-                if (!hp_init) { hp_xprev = x; hp_yprev = 0; hp_init = true; }
-                // y = x - x_prev + (255/256)*y_prev  -> ~5 Hz high-pass @16k
-                int32_t y = x - hp_xprev + (hp_yprev - (hp_yprev >> 8));
-                hp_xprev = x; hp_yprev = y;
-                if (sel_locked) {           // skip warmup transient
-                    int v = y * REC_SW_GAIN;
-                    if (v >  32767) v =  32767;
-                    if (v < -32768) v = -32768;
-                    mono[outn++] = (int16_t)v;
+            for (int i = 0; i < n; i++) {
+                int16_t s = extract_cand(stereo[i * 2], stereo[i * 2 + 1], sel);
+                for (int k = DECIM_NTAPS - 1; k > 0; k--) hist[k] = hist[k - 1];
+                hist[0] = s;
+                if (++phase >= 3) {
+                    phase = 0;
+                    int32_t acc = 0;
+                    for (int k = 0; k < DECIM_NTAPS; k++)
+                        acc += (int32_t)DECIM_COEF[k] * hist[k];
+                    int32_t x = acc >> 15;          // decimated 16k sample
+                    if (!hp_init) { hp_xprev = x; hp_yprev = 0; hp_init = true; }
+                    // y = x - x_prev + (255/256)*y_prev  -> ~5 Hz high-pass @16k
+                    int32_t y = x - hp_xprev + (hp_yprev - (hp_yprev >> 8));
+                    hp_xprev = x; hp_yprev = y;
+                    if (sel_locked) {               // skip warmup transient
+                        int v = y * REC_SW_GAIN;
+                        if (v >  32767) v =  32767;
+                        if (v < -32768) v = -32768;
+                        mono[outn++] = (int16_t)v;
+                    }
                 }
             }
 
@@ -442,7 +397,6 @@ static void rec_task(void *)
         ESP_LOGE(TAG, "rec_task OOM");
     }
     heap_caps_free(stereo);
-    heap_caps_free(mic48);
     heap_caps_free(mono);
     xSemaphoreGive(s_rec_done);
     vTaskDelete(nullptr);
