@@ -150,7 +150,7 @@ static bool i2s_start(void)
 
     i2s_std_config_t rx_std = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(REC_CAPTURE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                          I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = (gpio_num_t)I2S_MCLK,
@@ -161,10 +161,13 @@ static bool i2s_start(void)
             .invert_flags = { false, false, false },
         },
     };
-    // 32-bit slot (64 BCLK per WS): the ES8311 16-bit ADC word lands in the high
-    // or low half of a channel slot (board dependent), recovered by the
-    // auto-detected candidate in rec_task.
-    rx_std.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    // 32-bit data/slot (64 BCLK/frame, ws_width 32) — exactly the framing the
+    // reference master uses, so data_bit_width, slot_bit_width and ws_width are all
+    // consistent. (Forcing slot_bit_width=32 on a 16-bit slot leaves ws_width=16,
+    // which malforms the frame now that THIS channel is the master generating WS
+    // and made the ES8311 deliver a half-rate clock -> 2x time compression.) The
+    // ES8311 16-bit ADC word lands in the high or low half of a channel slot
+    // (board dependent), recovered by the auto-detected candidate in rec_task.
     if (i2s_channel_init_std_mode(s_rx, &rx_std) != ESP_OK) return false;
     if (i2s_channel_enable(s_rx) != ESP_OK) return false;
 
