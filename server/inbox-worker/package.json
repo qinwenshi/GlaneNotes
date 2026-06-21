@@ -1,0 +1,14 @@
+{
+  "name": "glane-notes-inbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:temp": "wrangler deploy --temporary"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}

@@ -1,7 +1,8 @@
-// sync.cpp — scan SD notes and transcribe any lacking a .txt transcript.
+// sync.cpp — scan SD notes, transcribe any lacking a .txt, then push to inbox.
 #include "sync.h"
 #include "glane_config.h"
 #include "transcribe.h"
+#include "inbox.h"
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +38,24 @@ static bool text_exists(const char *id)
     path_for(p, sizeof(p), id, ".txt");
     struct stat st;
     return stat(p, &st) == 0;
+}
+
+// A ".pushed" sidecar marks a note already delivered to the inbox webhook, so
+// re-syncs never create duplicate pages (mirrors the .txt "done" convention).
+static bool pushed_exists(const char *id)
+{
+    char p[160];
+    path_for(p, sizeof(p), id, ".pushed");
+    struct stat st;
+    return stat(p, &st) == 0;
+}
+
+static void mark_pushed(const char *id)
+{
+    char p[160];
+    path_for(p, sizeof(p), id, ".pushed");
+    FILE *f = fopen(p, "wb");
+    if (f) { fputc('1', f); fclose(f); }
 }
 
 static int cmp_desc(const void *a, const void *b)
@@ -83,6 +102,20 @@ int notes_pending_count(void)
     return pending;
 }
 
+// Notes still needing any sync work: missing transcript, or (when an inbox is
+// configured) not yet delivered to it.
+int sync_pending_count(void)
+{
+    static note_info_t list[MAX_NOTES];
+    int n = notes_scan(list, MAX_NOTES);
+    bool ib = inbox_enabled();
+    int pending = 0;
+    for (int i = 0; i < n; i++) {
+        if (!list[i].has_text || (ib && !pushed_exists(list[i].id))) pending++;
+    }
+    return pending;
+}
+
 char *notes_read_text(const char *id)
 {
     char p[160];
@@ -105,52 +138,79 @@ int sync_run(sync_progress_cb_t cb)
 {
     static note_info_t list[MAX_NOTES];
     int n = notes_scan(list, MAX_NOTES);
+    bool ib = inbox_enabled();
 
     int total = 0;
-    for (int i = 0; i < n; i++) if (!list[i].has_text) total++;
+    for (int i = 0; i < n; i++) {
+        if (!list[i].has_text || (ib && !pushed_exists(list[i].id))) total++;
+    }
     if (total == 0) {
         if (cb) cb(0, 0);
         return 0;
     }
 
-    int done = 0, ok = 0;
+    int done = 0, ok = 0, pushed = 0;
     if (cb) cb(done, total);
 
     for (int i = 0; i < n; i++) {
-        if (list[i].has_text) continue;
+        bool needs_text = !list[i].has_text;
+        bool needs_push = ib && !pushed_exists(list[i].id);
+        if (!needs_text && !needs_push) continue;
 
         char wav[160], txt[160];
         path_for(wav, sizeof(wav), list[i].id, ".wav");
         path_for(txt, sizeof(txt), list[i].id, ".txt");
 
-        char *text = nullptr;
-        tr_result_t r = transcribe_wav_file(wav, &text);
-        if (r == TR_OK && text) {
-            FILE *f = fopen(txt, "wb");
-            if (f) {
-                fwrite(text, 1, strlen(text), f);
-                fclose(f);
-                ok++;
-                ESP_LOGI(TAG, "%s -> %u chars", list[i].id, (unsigned)strlen(text));
+        // ── Phase 1: ensure a transcript exists ──
+        if (needs_text) {
+            char *text = nullptr;
+            tr_result_t r = transcribe_wav_file(wav, &text);
+            if (r == TR_OK && text) {
+                FILE *f = fopen(txt, "wb");
+                if (f) {
+                    fwrite(text, 1, strlen(text), f);
+                    fclose(f);
+                    ok++;
+                    list[i].has_text = true;
+                    ESP_LOGI(TAG, "%s -> %u chars", list[i].id, (unsigned)strlen(text));
+                }
+                free(text);
+            } else if (r == TR_TOO_LARGE) {
+                // Mark as handled so we don't retry forever: write a stub note.
+                FILE *f = fopen(txt, "wb");
+                if (f) {
+                    const char *m = "[audio too long for auto-transcription]";
+                    fwrite(m, 1, strlen(m), f);
+                    fclose(f);
+                    list[i].has_text = true;
+                }
+                ESP_LOGW(TAG, "%s too large, stubbed", list[i].id);
+            } else {
+                ESP_LOGW(TAG, "%s transcription failed (%d)", list[i].id, r);
+                // Leave it pending for a future sync.
             }
-            free(text);
-        } else if (r == TR_TOO_LARGE) {
-            // Mark as handled so we don't retry forever: write a stub note.
-            FILE *f = fopen(txt, "wb");
-            if (f) {
-                const char *m = "[audio too long for auto-transcription]";
-                fwrite(m, 1, strlen(m), f);
-                fclose(f);
+        }
+
+        // ── Phase 2: push the transcript to the inbox webhook ──
+        if (ib && list[i].has_text && !pushed_exists(list[i].id)) {
+            char *text = notes_read_text(list[i].id);
+            if (text) {
+                int dur = (list[i].wav_bytes > 44)
+                              ? (int)((list[i].wav_bytes - 44) / (16000 * 2)) : 0;
+                ib_result_t ir = inbox_push(list[i].id, list[i].mtime, dur, text);
+                if (ir == IB_OK) {
+                    mark_pushed(list[i].id);
+                    pushed++;
+                } else {
+                    ESP_LOGW(TAG, "%s inbox push failed (%d)", list[i].id, ir);
+                }
+                free(text);
             }
-            ESP_LOGW(TAG, "%s too large, stubbed", list[i].id);
-        } else {
-            ESP_LOGW(TAG, "%s transcription failed (%d)", list[i].id, r);
-            // Leave it pending for a future sync.
         }
 
         done++;
         if (cb) cb(done, total);
     }
-    ESP_LOGI(TAG, "sync done: %d/%d transcribed", ok, total);
+    ESP_LOGI(TAG, "sync done: %d transcribed, %d pushed (of %d pending)", ok, pushed, total);
     return ok;
 }

@@ -1,0 +1,12 @@
+name = "glane-notes-inbox"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Secrets (do NOT put real values here — set them out of band):
+#   wrangler secret put INBOX_TOKEN
+#   wrangler secret put NOTION_TOKEN
+#   wrangler secret put NOTION_DB_ID
+#
+# Or, for a quick throwaway test with a temporary Cloudflare account:
+#   wrangler deploy --temporary
+# then set the three secrets and claim the account to keep it.

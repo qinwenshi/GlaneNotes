@@ -196,7 +196,7 @@ static void do_sync(void)
         return;
     }
 
-    int pending = notes_pending_count();
+    int pending = sync_pending_count();
     if (pending == 0) {
         ui_show_message("ALL SYNCED", wifi_mgr_ip());
         vTaskDelay(pdMS_TO_TICKS(1500));

@@ -295,6 +295,17 @@ static esp_err_t h_settings_get(httpd_req_t *r)
 
     send_chunk(r, "<div class='muted'>Used to transcribe notes via Aliyun qwen3-asr-flash. "
                   "Audio stays on the SD card; only sync uploads it.</div>");
+
+    send_chunk(r, "<label>Inbox webhook URL</label><input name='inboxurl' value='");
+    send_escaped(r, cfg->inbox_url);
+    send_chunk(r, "' placeholder='https://your-worker.workers.dev/inbox'>");
+
+    send_chunk(r, "<label>Inbox token</label><input name='inboxtok' type='password' placeholder='");
+    send_chunk(r, settings_has_inbox() && cfg->inbox_token[0] ? "(set — leave blank to keep)" : "bearer token");
+    send_chunk(r, "'>");
+
+    send_chunk(r, "<div class='muted'>Optional: after transcription, each note is pushed "
+                  "to this webhook (a Cloudflare Worker → Notion inbox). Leave the URL blank to disable.</div>");
     send_chunk(r, "<div class='actions'><button>Save</button></div></div></form>");
 
     char ipline[96];
@@ -322,16 +333,19 @@ static esp_err_t read_body(httpd_req_t *r, char *buf, size_t n)
 
 static esp_err_t h_settings_post(httpd_req_t *r)
 {
-    char body[512];
+    char body[1024];
     if (read_body(r, body, sizeof(body)) != ESP_OK) {
         httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body");
         return ESP_OK;
     }
 
     char ssid[96] = {0}, pass[96] = {0}, key[128] = {0};
+    char inboxurl[160] = {0}, inboxtok[96] = {0};
     bool has_ssid = get_param(r, body, "ssid", ssid, sizeof(ssid));
     bool has_pass = get_param(r, body, "pass", pass, sizeof(pass));
     bool has_key  = get_param(r, body, "apikey", key, sizeof(key));
+    bool has_url  = get_param(r, body, "inboxurl", inboxurl, sizeof(inboxurl));
+    bool has_tok  = get_param(r, body, "inboxtok", inboxtok, sizeof(inboxtok));
 
     if (has_ssid && ssid[0]) {
         // If password left blank, keep the stored one.
@@ -340,6 +354,11 @@ static esp_err_t h_settings_post(httpd_req_t *r)
     }
     if (has_key && key[0]) {
         settings_set_api_key(key);
+    }
+    if (has_url) {
+        // Clearing the URL disables the inbox. Blank token keeps the stored one.
+        const char *t = (has_tok && inboxtok[0]) ? inboxtok : settings_get()->inbox_token;
+        settings_set_inbox(inboxurl, t);
     }
 
     httpd_resp_set_status(r, "302 Found");

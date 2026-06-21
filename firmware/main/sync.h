@@ -27,6 +27,10 @@ int notes_scan(note_info_t *out, int max);
 // Count of notes whose transcript (.txt) is missing.
 int notes_pending_count(void);
 
+// Count of notes still needing any sync work (missing transcript, or — when an
+// inbox webhook is configured — not yet delivered to it).
+int sync_pending_count(void);
+
 // Read a note's transcript into a freshly malloc'd buffer (caller frees), or
 // NULL if none. Used by the web dashboard.
 char *notes_read_text(const char *id);

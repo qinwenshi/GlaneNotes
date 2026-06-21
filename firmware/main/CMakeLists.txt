@@ -14,6 +14,7 @@ idf_component_register(
         "wifi_mgr.cpp"
         "transcribe.cpp"
         "sync.cpp"
+        "inbox.cpp"
         "webserver.cpp"
     INCLUDE_DIRS
         "."

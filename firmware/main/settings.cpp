@@ -23,12 +23,12 @@ static volatile bool    s_dirty = false;   // set when wifi/api key is written
 #define GLANE_DEFAULT_DS_KEY ""
 #endif
 
-static void load_str(nvs_handle_t h, const char *key, char *out, const char *def)
+static void load_str(nvs_handle_t h, const char *key, char *out, size_t cap, const char *def)
 {
-    size_t len = SETTINGS_STR_MAX;
+    size_t len = cap;
     if (nvs_get_str(h, key, out, &len) != ESP_OK) {
-        strncpy(out, def, SETTINGS_STR_MAX - 1);
-        out[SETTINGS_STR_MAX - 1] = '\0';
+        strncpy(out, def, cap - 1);
+        out[cap - 1] = '\0';
     }
 }
 
@@ -37,9 +37,11 @@ void settings_init(void)
     memset(&s_cfg, 0, sizeof(s_cfg));
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
-        load_str(h, "ssid", s_cfg.wifi_ssid, GLANE_DEFAULT_WIFI_SSID);
-        load_str(h, "pass", s_cfg.wifi_pass, GLANE_DEFAULT_WIFI_PASS);
-        load_str(h, "apikey", s_cfg.ds_api_key, GLANE_DEFAULT_DS_KEY);
+        load_str(h, "ssid", s_cfg.wifi_ssid, SETTINGS_STR_MAX, GLANE_DEFAULT_WIFI_SSID);
+        load_str(h, "pass", s_cfg.wifi_pass, SETTINGS_STR_MAX, GLANE_DEFAULT_WIFI_PASS);
+        load_str(h, "apikey", s_cfg.ds_api_key, SETTINGS_STR_MAX, GLANE_DEFAULT_DS_KEY);
+        load_str(h, "inboxurl", s_cfg.inbox_url, SETTINGS_URL_MAX, "");
+        load_str(h, "inboxtok", s_cfg.inbox_token, SETTINGS_STR_MAX, "");
         nvs_close(h);
     } else {
         strncpy(s_cfg.wifi_ssid, GLANE_DEFAULT_WIFI_SSID, SETTINGS_STR_MAX - 1);
@@ -83,6 +85,17 @@ void settings_set_api_key(const char *key)
     s_dirty = true;
 }
 
+void settings_set_inbox(const char *url, const char *token)
+{
+    strncpy(s_cfg.inbox_url, url, SETTINGS_URL_MAX - 1);
+    s_cfg.inbox_url[SETTINGS_URL_MAX - 1] = '\0';
+    strncpy(s_cfg.inbox_token, token, SETTINGS_STR_MAX - 1);
+    s_cfg.inbox_token[SETTINGS_STR_MAX - 1] = '\0';
+    store_str("inboxurl", s_cfg.inbox_url);
+    store_str("inboxtok", s_cfg.inbox_token);
+    s_dirty = true;
+}
+
 bool settings_take_dirty(void)
 {
     bool d = s_dirty;
@@ -92,6 +105,7 @@ bool settings_take_dirty(void)
 
 bool settings_has_wifi(void)    { return s_cfg.wifi_ssid[0] != '\0'; }
 bool settings_has_api_key(void) { return s_cfg.ds_api_key[0] != '\0'; }
+bool settings_has_inbox(void)   { return s_cfg.inbox_url[0] != '\0'; }
 
 uint32_t settings_next_note_seq(void)
 {
