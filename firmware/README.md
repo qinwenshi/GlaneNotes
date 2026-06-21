@@ -6,7 +6,10 @@ A voice-recorder note device for the **Waveshare ESP32-S3-ePaper-1.54** board
 Press a button → record your voice to the SD card as WAV. When you sync over
 Wi-Fi, each recording is uploaded once over HTTPS to **Aliyun DashScope
 (`qwen3-asr-flash`)**, transcribed, and the text is written back next to the
-audio on the SD card. Browse everything from a small built-in web dashboard.
+audio on the SD card. If an inbox webhook is configured, that local transcript
+is also POSTed to the server-side inbox Worker (for example a Cloudflare Worker
+that files the note into Notion). Browse everything from a small built-in web
+dashboard.
 
 > Audio stays **local on the SD card by default**. It is only uploaded when you
 > explicitly request a network sync. Transcription is **file-based (one HTTPS
@@ -158,7 +161,7 @@ what each press does.
 | Action | Result |
 |---|---|
 | **Short-press BOOT** | Start recording (rising tone). Press again to stop. |
-| **Long-press BOOT** | Trigger a Wi-Fi sync (transcribe all un-transcribed notes) |
+| **Long-press BOOT** | Trigger a Wi-Fi sync (transcribe missing `.txt` files and push transcripts to the inbox webhook if configured) |
 | **Short-press PWR** | Open the on-device **notes list** |
 | **Long-press PWR** (≥0.8 s) | Enter deep sleep immediately |
 | Idle for a while | Device enters deep sleep; press BOOT to wake |
