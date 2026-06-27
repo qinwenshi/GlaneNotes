@@ -18,6 +18,7 @@ void ui_show_message(const char *line1, const char *line2);
 
 // Wi-Fi provisioning screen: shows the SoftAP SSID to join and the URL to open.
 void ui_show_provision(const char *ssid, const char *url);
+void ui_show_wifi_failed(const char *ssid);
 void ui_show_syncing(int done, int total);
 
 // Notes browser. `items` newest-first; `selected` is the absolute index into

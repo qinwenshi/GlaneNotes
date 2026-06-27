@@ -328,6 +328,23 @@ void ui_show_provision(const char *ssid, const char *url)
     commit(SCR_TAG);   // distinct kind; refresh strategy is partial regardless
 }
 
+void ui_show_wifi_failed(const char *ssid)
+{
+    if (!s_epd) return;
+    s_epd->EPD_Clear();
+    draw_text_centered(18, "WIFI FAILED", 2);
+    hline(46, 16, EPD_W - 16);
+
+    draw_text_centered(66, "Could not connect", 1);
+    if (ssid && ssid[0]) draw_text_centered(84, ssid, 1);
+
+    hline(126, 16, EPD_W - 16);
+    draw_text_centered(142, "BOOT: SETUP WIFI", 1);
+    draw_text_centered(160, "PWR: OFFLINE HOME", 1);
+    draw_text_centered(178, "HOLD PWR: SLEEP", 1);
+    commit(SCR_MSG);
+}
+
 void ui_show_syncing(int done, int total)
 {
     if (!s_epd) return;

@@ -47,7 +47,7 @@ static inline uint32_t millis(void)
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
-enum class State { IDLE, RECORDING, SYNCING, LIST, DETAIL, PLAYING, PROVISION };
+enum class State { IDLE, RECORDING, SYNCING, LIST, DETAIL, PLAYING, PROVISION, WIFI_FAILED };
 static State            s_state          = State::IDLE;
 static volatile bool    s_sync_requested = false;   // set by web handler
 static volatile bool    s_wifi_connecting = false;  // boot-time bg connect in flight
@@ -175,10 +175,9 @@ static void do_sync(void)
     }
 
     if (!wifi_mgr_is_connected()) {
-        ui_show_message("WIFI FAILED", "Working offline");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        s_state = State::IDLE;
-        show_idle();
+        s_state = State::WIFI_FAILED;
+        s_last_activity = millis();
+        ui_show_wifi_failed(settings_get()->wifi_ssid);
         return;
     }
 
@@ -385,6 +384,7 @@ static void main_task(void *)
                 case State::IDLE:      do_sync();        break;
                 case State::LIST:
                 case State::DETAIL:    go_idle();        break;  // back home
+                case State::WIFI_FAILED: start_provisioning(); break;
                 default: break;
             }
         } else if (buttons_boot_fired(&held)) {
@@ -396,6 +396,7 @@ static void main_task(void *)
                 case State::DETAIL:    play_current();    break;
                 case State::PLAYING:   stop_playback();   break;
                 case State::PROVISION: cancel_provisioning(); break;
+                case State::WIFI_FAILED: start_provisioning(); break;
                 default: break;
             }
         }
@@ -411,6 +412,7 @@ static void main_task(void *)
                 case State::DETAIL:    back_to_list();                              break;
                 case State::PLAYING:   stop_playback();                             break;
                 case State::PROVISION: cancel_provisioning();                       break;
+                case State::WIFI_FAILED: lng ? enter_deep_sleep() : go_idle();      break;
                 default: break;
             }
         }
